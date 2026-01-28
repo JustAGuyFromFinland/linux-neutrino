@@ -142,7 +142,7 @@ config MPENTIUM4
 
 config MNEUTRINO
 	bool "Linux-Neutrino (AVX2/SSE4.2 Optimized)"
-	---help---
+	help
 	  Optimize for modern x86_64 CPUs with AVX2 and SSE4.2 support.
 	  This will pass -march=haswell and -O3 to the compiler.
 
