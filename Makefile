@@ -2,8 +2,8 @@
 VERSION = 6
 PATCHLEVEL = 19
 SUBLEVEL = 0
-EXTRAVERSION = -rc7
-NAME = Baby Opossum Posse
+EXTRAVERSION = -neutrino
+NAME = Hurried Neutrino
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
