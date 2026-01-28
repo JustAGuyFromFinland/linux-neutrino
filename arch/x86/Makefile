@@ -84,7 +84,7 @@ KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-av
 #
 # CFLAGS for compiling floating point code inside the kernel.
 #
-CC_FLAGS_FPU := -msse -msse2
+CC_FLAGS_FPU := -msse -msse2 -mavx -mavx2
 ifdef CONFIG_CC_IS_GCC
 CC_FLAGS_FPU += -mhard-float
 endif
@@ -164,7 +164,11 @@ else
 	# Use -mskip-rax-setup if supported.
 	KBUILD_CFLAGS += -mskip-rax-setup
 
-ifdef CONFIG_X86_NATIVE_CPU
+ifdef CONFIG_MNEUTRINO
+        # Target Haswell (AVX2/SSE4.2) and optimize for speed (-O3)
+        KBUILD_CFLAGS += -march=haswell -O3 -pipe
+        KBUILD_RUSTFLAGS += -Ctarget-cpu=haswell -Copt-level=3
+else ifdef CONFIG_X86_NATIVE_CPU
         KBUILD_CFLAGS += -march=native
         KBUILD_RUSTFLAGS += -Ctarget-cpu=native
 else
