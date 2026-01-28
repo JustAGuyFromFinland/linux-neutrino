@@ -140,6 +140,12 @@ config MPENTIUM4
 		-Prestonia
 		-Gallatin
 
+config MNEUTRINO
+	bool "Linux-Neutrino (AVX2/SSE4.2 Optimized)"
+	---help---
+	  Optimize for modern x86_64 CPUs with AVX2 and SSE4.2 support.
+	  This will pass -march=haswell and -O3 to the compiler.
+
 config MK6
 	bool "K6/K6-II/K6-III"
 	depends on X86_32
