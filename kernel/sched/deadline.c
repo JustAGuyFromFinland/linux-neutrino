@@ -132,13 +132,31 @@ static inline int dl_bw_cpus(int i)
 	return cpumask_weight_and(rd->span, cpu_active_mask);
 }
 
+/*
+ * __dl_bw_capacity - calculate total capacity of CPUs in mask
+ *
+ * Optimized with prefetching for better cache behavior when
+ * iterating over multiple CPUs.
+ */
 static inline unsigned long __dl_bw_capacity(const struct cpumask *mask)
 {
 	unsigned long cap = 0;
-	int i;
+	int i, prev = -1;
 
-	for_each_cpu_and(i, mask, cpu_active_mask)
+	for_each_cpu_and(i, mask, cpu_active_mask) {
+		/*
+		 * Prefetch next CPU's capacity data while processing current.
+		 * arch_scale_cpu_capacity typically accesses per-cpu data.
+		 */
+		if (prev >= 0) {
+			int next = cpumask_next_and(i, mask, cpu_active_mask);
+			if (next < nr_cpu_ids)
+				prefetch(&cpu_rq(next)->cpu_capacity);
+		}
+		prev = i;
+
 		cap += arch_scale_cpu_capacity(i);
+	}
 
 	return cap;
 }
@@ -171,16 +189,30 @@ bool dl_bw_visited(int cpu, u64 cookie)
 	return false;
 }
 
+/*
+ * __dl_update - update extra bandwidth for all CPUs in root domain
+ *
+ * Optimized with prefetching to hide memory latency when iterating
+ * over runqueues in the span.
+ */
 static inline
 void __dl_update(struct dl_bw *dl_b, s64 bw)
 {
 	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
-	int i;
+	int i, prev = -1;
 
 	RCU_LOCKDEP_WARN(!rcu_read_lock_sched_held(),
 			 "sched RCU must be held");
 	for_each_cpu_and(i, rd->span, cpu_active_mask) {
 		struct rq *rq = cpu_rq(i);
+
+		/* Prefetch next rq while updating current */
+		if (prev >= 0) {
+			int next = cpumask_next_and(i, rd->span, cpu_active_mask);
+			if (next < nr_cpu_ids)
+				prefetch(&cpu_rq(next)->dl);
+		}
+		prev = i;
 
 		rq->dl.extra_bw += bw;
 	}

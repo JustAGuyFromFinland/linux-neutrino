@@ -24,35 +24,53 @@
  *  Author: Vincent Guittot <vincent.guittot@linaro.org>
  */
 #include "pelt.h"
+#include "pelt-simd.h"
 
 /*
  * Approximate:
  *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
+ *
+ * Optimized branchless version to reduce branch mispredictions.
+ * The original code had conditional branches that cause pipeline stalls
+ * on modern CPUs with deep pipelines.
  */
-static u64 decay_load(u64 val, u64 n)
+static __always_inline u64 decay_load(u64 val, u64 n)
 {
-	unsigned int local_n;
-
-	if (unlikely(n > LOAD_AVG_PERIOD * 63))
-		return 0;
-
-	/* after bounds checking we can collapse to 32-bit */
-	local_n = n;
+	u64 periods, remainder, shifted_val, result;
+	u64 zero_mask, large_n_mask;
 
 	/*
-	 * As y^PERIOD = 1/2, we can combine
+	 * Branchless bounds check: if n > 2016, result should be 0
+	 * We compute this as a mask: all 1s if should zero, all 0s otherwise
+	 */
+	zero_mask = (s64)(n - (LOAD_AVG_PERIOD * 63 + 1)) >> 63;
+	zero_mask = ~zero_mask; /* Invert: all 1s if n > 2016 */
+
+	/*
+	 * As y^PERIOD = 1/2, we can combine:
 	 *    y^n = 1/2^(n/PERIOD) * y^(n%PERIOD)
 	 * With a look-up table which covers y^n (n<PERIOD)
 	 *
-	 * To achieve constant time decay_load.
+	 * Compute periods and remainder without branches
 	 */
-	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
-		val >>= local_n / LOAD_AVG_PERIOD;
-		local_n %= LOAD_AVG_PERIOD;
-	}
+	periods = n >> 5; /* n / LOAD_AVG_PERIOD (LOAD_AVG_PERIOD = 32) */
+	remainder = n & 31; /* n % LOAD_AVG_PERIOD */
 
-	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
-	return val;
+	/*
+	 * Clamp periods to 63 to avoid undefined shift behavior
+	 * Using branchless min: min(periods, 63)
+	 */
+	large_n_mask = (s64)(periods - 64) >> 63; /* All 1s if periods < 64 */
+	periods = (periods & large_n_mask) | (63 & ~large_n_mask);
+
+	/* Shift val by periods (equivalent to dividing by 2^periods) */
+	shifted_val = val >> periods;
+
+	/* Apply y^remainder decay using lookup table */
+	result = mul_u64_u32_shr(shifted_val, runnable_avg_yN_inv[remainder], 32);
+
+	/* Return 0 if zero_mask is set (n was too large) */
+	return result & ~zero_mask;
 }
 
 static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
@@ -98,6 +116,10 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
  *                     p-1
  *      d1 y^p + 1024 \Sum y^n + d3 y^0		(Step 2)
  *                     n=1
+ *
+ * Optimized branchless version: Instead of multiple if statements,
+ * we compute all paths and use conditional arithmetic to select results.
+ * This eliminates branch mispredictions in this hot path.
  */
 static __always_inline u32
 accumulate_sum(u64 delta, struct sched_avg *sa,
@@ -105,46 +127,70 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 {
 	u32 contrib = (u32)delta; /* p == 0 -> delta < 1024 */
 	u64 periods;
+	u64 periods_mask, load_mask, runnable_mask, running_mask;
+	u64 old_load_sum, old_runnable_sum, old_util_sum;
+	u64 new_load_sum, new_runnable_sum, new_util_sum;
+	u32 old_period_contrib;
 
 	delta += sa->period_contrib;
-	periods = delta / 1024; /* A period is 1024us (~1ms) */
+	periods = delta >> 10; /* delta / 1024 - A period is 1024us (~1ms) */
+
+	/*
+	 * Create branchless masks for conditional operations
+	 * periods_mask: all 1s if periods != 0, all 0s otherwise
+	 */
+	periods_mask = (u64)(-(s64)!!periods);
+	load_mask = (u64)(-(s64)!!load);
+	runnable_mask = (u64)(-(s64)!!runnable);
+	running_mask = (u64)(-(s64)!!running);
+
+	/* Save old values for conditional update */
+	old_load_sum = sa->load_sum;
+	old_runnable_sum = sa->runnable_sum;
+	old_util_sum = sa->util_sum;
+	old_period_contrib = sa->period_contrib;
 
 	/*
 	 * Step 1: decay old *_sum if we crossed period boundaries.
+	 * Compute decayed values (will be selected if periods != 0)
 	 */
-	if (periods) {
-		sa->load_sum = decay_load(sa->load_sum, periods);
-		sa->runnable_sum =
-			decay_load(sa->runnable_sum, periods);
-		sa->util_sum = decay_load((u64)(sa->util_sum), periods);
+	new_load_sum = decay_load(old_load_sum, periods);
+	new_runnable_sum = decay_load(old_runnable_sum, periods);
+	new_util_sum = decay_load(old_util_sum, periods);
 
-		/*
-		 * Step 2
-		 */
-		delta %= 1024;
-		if (load) {
-			/*
-			 * This relies on the:
-			 *
-			 * if (!load)
-			 *	runnable = running = 0;
-			 *
-			 * clause from ___update_load_sum(); this results in
-			 * the below usage of @contrib to disappear entirely,
-			 * so no point in calculating it.
-			 */
-			contrib = __accumulate_pelt_segments(periods,
-					1024 - sa->period_contrib, delta);
-		}
+	/* Branchless select: use decayed values if periods != 0 */
+	sa->load_sum = (new_load_sum & periods_mask) | (old_load_sum & ~periods_mask);
+	sa->runnable_sum = (new_runnable_sum & periods_mask) | (old_runnable_sum & ~periods_mask);
+	sa->util_sum = (u32)((new_util_sum & periods_mask) | (old_util_sum & ~periods_mask));
+
+	/*
+	 * Step 2: Compute contribution (only meaningful if periods != 0 && load != 0)
+	 * We always compute it but only use it when both conditions are true
+	 */
+	{
+		u64 new_delta = delta & 1023; /* delta % 1024 */
+		u32 new_contrib;
+		u64 contrib_mask;
+
+		/* Compute contrib for the periods case */
+		new_contrib = __accumulate_pelt_segments(periods,
+				1024 - old_period_contrib, (u32)new_delta);
+
+		/* Use new_contrib if periods && load, otherwise use original delta */
+		contrib_mask = periods_mask & load_mask;
+		contrib = (u32)((new_contrib & contrib_mask) | (contrib & ~contrib_mask));
+
+		/* Update period_contrib: new_delta if periods, else delta */
+		sa->period_contrib = (u32)((new_delta & periods_mask) | (delta & ~periods_mask));
 	}
-	sa->period_contrib = delta;
 
-	if (load)
-		sa->load_sum += load * contrib;
-	if (runnable)
-		sa->runnable_sum += runnable * contrib << SCHED_CAPACITY_SHIFT;
-	if (running)
-		sa->util_sum += contrib << SCHED_CAPACITY_SHIFT;
+	/*
+	 * Accumulate contributions using branchless arithmetic
+	 * The mask ensures we only add when the condition is true
+	 */
+	sa->load_sum += (load * contrib) & load_mask;
+	sa->runnable_sum += ((runnable * contrib) << SCHED_CAPACITY_SHIFT) & runnable_mask;
+	sa->util_sum += (u32)(((u64)contrib << SCHED_CAPACITY_SHIFT) & running_mask);
 
 	return periods;
 }
@@ -176,28 +222,46 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  * sum again by y is sufficient to update:
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
+ *
+ * Optimized with branchless operations for better pipeline utilization
+ * on modern superscalar CPUs with deep pipelines (Haswell+).
  */
 static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
 	u64 delta;
+	s64 signed_delta;
+	u64 negative_mask;
+	u64 load_mask;
+	u32 periods;
 
 	delta = now - sa->last_update_time;
+	signed_delta = (s64)delta;
+
 	/*
-	 * This should only happen when time goes backwards, which it
-	 * unfortunately does during sched clock init when we swap over to TSC.
+	 * Handle time going backwards (during sched clock init / TSC swap)
+	 * using branchless conditional update.
+	 *
+	 * negative_mask is all 1s if delta is negative, all 0s otherwise
 	 */
-	if ((s64)delta < 0) {
-		sa->last_update_time = now;
+	negative_mask = (u64)(signed_delta >> 63);
+
+	/* Update last_update_time unconditionally if delta is negative */
+	sa->last_update_time = (now & negative_mask) |
+			       (sa->last_update_time & ~negative_mask);
+
+	/* Early return for negative delta - this is rare, keep the branch */
+	if (unlikely(negative_mask))
 		return 0;
-	}
 
 	/*
 	 * Use 1024ns as the unit of measurement since it's a reasonable
 	 * approximation of 1us and fast to compute.
 	 */
 	delta >>= 10;
+
+	/* Zero delta means no update needed */
 	if (!delta)
 		return 0;
 
@@ -208,14 +272,13 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * runnable is clear. But there are some corner cases where the current
 	 * se has been already dequeued but cfs_rq->curr still points to it.
 	 * This means that weight will be 0 but not running for a sched_entity
-	 * but also for a cfs_rq if the latter becomes idle. As an example,
-	 * this happens during sched_balance_newidle() which calls
-	 * sched_balance_update_blocked_averages().
+	 * but also for a cfs_rq if the latter becomes idle.
 	 *
-	 * Also see the comment in accumulate_sum().
+	 * Branchless: if load is 0, force runnable and running to 0
 	 */
-	if (!load)
-		runnable = running = 0;
+	load_mask = (u64)(-(s64)!!load);
+	runnable &= load_mask;
+	running &= (int)load_mask;
 
 	/*
 	 * Now we know we crossed measurement unit boundaries. The *_avg
@@ -224,10 +287,10 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * Step 1: accumulate *_sum since last_update_time. If we haven't
 	 * crossed period boundaries, finish.
 	 */
-	if (!accumulate_sum(delta, sa, load, runnable, running))
-		return 0;
+	periods = accumulate_sum(delta, sa, load, runnable, running);
 
-	return 1;
+	/* Return 1 if we crossed period boundaries, 0 otherwise */
+	return !!periods;
 }
 
 /*

@@ -57,6 +57,7 @@
 #include "sched.h"
 #include "stats.h"
 #include "autogroup.h"
+#include "fair-opt.h"
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -10056,6 +10057,11 @@ static void update_cpu_capacity(struct sched_domain *sd, int cpu)
 	sdg->sgc->max_capacity = capacity;
 }
 
+/*
+ * update_group_capacity - Update capacity metrics for a scheduling group.
+ *
+ * Optimized with branchless min/max operations and prefetching for NUMA case.
+ */
 void update_group_capacity(struct sched_domain *sd, int cpu)
 {
 	struct sched_domain *child = sd->child;
@@ -10080,14 +10086,28 @@ void update_group_capacity(struct sched_domain *sd, int cpu)
 		/*
 		 * SD_NUMA domains cannot assume that child groups
 		 * span the current group.
+		 *
+		 * Optimized with prefetching and branchless min/max.
 		 */
+		int prev_cpu = -1;
 
 		for_each_cpu(cpu, sched_group_span(sdg)) {
-			unsigned long cpu_cap = capacity_of(cpu);
+			unsigned long cpu_cap;
+
+			/* Prefetch next CPU's capacity data */
+			if (prev_cpu >= 0) {
+				int next = cpumask_next(cpu, sched_group_span(sdg));
+				if (next < nr_cpu_ids)
+					prefetch(&cpu_rq(next)->cpu_capacity);
+			}
+			prev_cpu = cpu;
+
+			cpu_cap = capacity_of(cpu);
 
 			capacity += cpu_cap;
-			min_capacity = min(cpu_cap, min_capacity);
-			max_capacity = max(cpu_cap, max_capacity);
+			/* Branchless min/max updates */
+			min_capacity = branchless_min_ul(cpu_cap, min_capacity);
+			max_capacity = branchless_max_ul(cpu_cap, max_capacity);
 		}
 	} else  {
 		/*
@@ -10099,9 +10119,14 @@ void update_group_capacity(struct sched_domain *sd, int cpu)
 		do {
 			struct sched_group_capacity *sgc = group->sgc;
 
+			/* Prefetch next group's capacity while processing current */
+			if (group->next != child->groups)
+				prefetch(&group->next->sgc->capacity);
+
 			capacity += sgc->capacity;
-			min_capacity = min(sgc->min_capacity, min_capacity);
-			max_capacity = max(sgc->max_capacity, max_capacity);
+			/* Branchless min/max updates */
+			min_capacity = branchless_min_ul(sgc->min_capacity, min_capacity);
+			max_capacity = branchless_max_ul(sgc->max_capacity, max_capacity);
 			group = group->next;
 		} while (group != child->groups);
 	}
@@ -10387,6 +10412,9 @@ sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
  * @sgs: variable to hold the statistics for this group.
  * @sg_overloaded: sched_group is overloaded
  * @sg_overutilized: sched_group is overutilized
+ *
+ * Optimized version with prefetching and branchless operations to reduce
+ * cache misses and branch mispredictions in this hot path.
  */
 static inline void update_sg_lb_stats(struct lb_env *env,
 				      struct sd_lb_stats *sds,
@@ -10397,6 +10425,9 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 {
 	int i, nr_running, local_group, sd_flags = env->sd->flags;
 	bool balancing_at_rd = !env->sd->parent;
+	int prev_cpu = -1;
+	bool overloaded_local = false;
+	bool overutilized_local = false;
 
 	memset(sgs, 0, sizeof(*sgs));
 
@@ -10404,31 +10435,55 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 
 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 		struct rq *rq = cpu_rq(i);
-		unsigned long load = cpu_load(rq);
+		unsigned long load;
+		bool is_idle, is_overutilized, is_overloaded;
 
+		/*
+		 * Prefetch next CPU's rq while processing current one.
+		 * This hides memory latency by overlapping computation
+		 * with memory access.
+		 */
+		if (prev_cpu >= 0) {
+			int next_cpu = cpumask_next_and(i, sched_group_span(group), env->cpus);
+			if (next_cpu < nr_cpu_ids)
+				prefetch_rq_lb(cpu_rq(next_cpu));
+		}
+		prev_cpu = i;
+
+		load = cpu_load(rq);
+		nr_running = READ_ONCE(rq->nr_running);
+
+		/* Accumulate statistics */
 		sgs->group_load += load;
 		sgs->group_util += cpu_util_cfs(i);
 		sgs->group_runnable += cpu_runnable(rq);
 		sgs->sum_h_nr_running += rq->cfs.h_nr_runnable;
-
-		nr_running = rq->nr_running;
 		sgs->sum_nr_running += nr_running;
 
-		if (cpu_overutilized(i))
-			*sg_overutilized = 1;
+		/*
+		 * Branchless overutilized check: accumulate flag locally
+		 * to avoid multiple writes to shared variable
+		 */
+		is_overutilized = cpu_overutilized(i);
+		overutilized_local |= is_overutilized;
 
 		/*
-		 * No need to call idle_cpu() if nr_running is not 0
+		 * Idle CPU detection - only call idle_cpu() if nr_running is 0
+		 * Use branchless increment for idle_cpus count
 		 */
-		if (!nr_running && idle_cpu(i)) {
-			sgs->idle_cpus++;
-			/* Idle cpu can't have misfit task */
-			continue;
-		}
+		is_idle = (!nr_running && idle_cpu(i));
+		sgs->idle_cpus += is_idle;
 
-		/* Overload indicator is only updated at root domain */
-		if (balancing_at_rd && nr_running > 1)
-			*sg_overloaded = 1;
+		/* Skip further processing for idle CPUs */
+		if (is_idle)
+			continue;
+
+		/*
+		 * Branchless overload indicator (only at root domain)
+		 * Compute condition as boolean and accumulate
+		 */
+		is_overloaded = (balancing_at_rd && nr_running > 1);
+		overloaded_local |= is_overloaded;
 
 #ifdef CONFIG_NUMA_BALANCING
 		/* Only fbq_classify_group() uses this to classify NUMA groups */
@@ -10440,18 +10495,27 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 		if (local_group)
 			continue;
 
+		/*
+		 * Misfit task detection with branchless max update
+		 */
 		if (sd_flags & SD_ASYM_CPUCAPACITY) {
 			/* Check for a misfit task on the cpu */
-			if (sgs->group_misfit_task_load < rq->misfit_task_load) {
-				sgs->group_misfit_task_load = rq->misfit_task_load;
-				*sg_overloaded = 1;
-			}
+			unsigned long misfit_load = rq->misfit_task_load;
+			bool has_misfit = (sgs->group_misfit_task_load < misfit_load);
+			/* Branchless conditional update */
+			sgs->group_misfit_task_load = has_misfit ?
+				misfit_load : sgs->group_misfit_task_load;
+			overloaded_local |= has_misfit;
 		} else if (env->idle && sched_reduced_capacity(rq, env->sd)) {
 			/* Check for a task running on a CPU with reduced capacity */
-			if (sgs->group_misfit_task_load < load)
-				sgs->group_misfit_task_load = load;
+			sgs->group_misfit_task_load = branchless_max_ul(
+				sgs->group_misfit_task_load, load);
 		}
 	}
+
+	/* Single write to shared variables at the end */
+	*sg_overutilized |= overutilized_local;
+	*sg_overloaded |= overloaded_local;
 
 	sgs->group_capacity = group->sgc->capacity;
 

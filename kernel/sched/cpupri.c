@@ -65,14 +65,23 @@ static int convert_prio(int prio)
 	return cpupri;
 }
 
+/*
+ * __cpupri_find - find CPUs at a specific priority level
+ *
+ * Optimized with prefetching and reduced branching for better
+ * cache utilization and pipeline efficiency.
+ */
 static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 				struct cpumask *lowest_mask, int idx)
 {
 	struct cpupri_vec *vec  = &cp->pri_to_cpu[idx];
-	int skip = 0;
+	int count;
 
-	if (!atomic_read(&(vec)->count))
-		skip = 1;
+	/* Prefetch the mask data while reading count */
+	prefetch(vec->mask);
+
+	count = atomic_read(&(vec)->count);
+
 	/*
 	 * When looking at the vector, we need to read the counter,
 	 * do a memory barrier, then read the mask.
@@ -94,7 +103,7 @@ static inline int __cpupri_find(struct cpupri *cp, struct task_struct *p,
 	smp_rmb();
 
 	/* Need to do the rmb for every iteration */
-	if (skip)
+	if (!count)
 		return 0;
 
 	if (cpumask_any_and(&p->cpus_mask, vec->mask) >= nr_cpu_ids)
@@ -140,6 +149,8 @@ int cpupri_find(struct cpupri *cp, struct task_struct *p,
  * any discrepancies created by racing against the uncertainty of the current
  * priority configuration.
  *
+ * Optimized with prefetching for the priority vector access pattern.
+ *
  * Return: (int)bool - CPUs were found
  */
 int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
@@ -152,6 +163,12 @@ int cpupri_find_fitness(struct cpupri *cp, struct task_struct *p,
 	WARN_ON_ONCE(task_pri >= CPUPRI_NR_PRIORITIES);
 
 	for (idx = 0; idx < task_pri; idx++) {
+		/*
+		 * Prefetch the next priority vector while processing current.
+		 * This hides memory latency in the priority search loop.
+		 */
+		if (idx + 1 < task_pri)
+			prefetch(&cp->pri_to_cpu[idx + 1]);
 
 		if (!__cpupri_find(cp, p, lowest_mask, idx))
 			continue;

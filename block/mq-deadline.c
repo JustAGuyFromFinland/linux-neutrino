@@ -101,7 +101,7 @@ struct deadline_data {
 	u32 async_depth;
 	int prio_aging_expire;
 
-	spinlock_t lock;
+	spinlock_t lock ____cacheline_aligned_in_smp;
 };
 
 /* Maps an I/O priority class to a deadline scheduler priority. */

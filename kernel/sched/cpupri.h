@@ -13,7 +13,7 @@
 struct cpupri_vec {
 	atomic_t		count;
 	cpumask_var_t		mask;
-};
+} ____cacheline_aligned_in_smp;
 
 struct cpupri {
 	struct cpupri_vec	pri_to_cpu[CPUPRI_NR_PRIORITIES];

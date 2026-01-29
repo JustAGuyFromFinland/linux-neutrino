@@ -176,7 +176,7 @@ struct kyber_queue_data {
 };
 
 struct kyber_hctx_data {
-	spinlock_t lock;
+	spinlock_t lock ____cacheline_aligned_in_smp;
 	struct list_head rqs[KYBER_NUM_DOMAINS];
 	unsigned int cur_domain;
 	unsigned int batching;

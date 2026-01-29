@@ -312,7 +312,7 @@ struct rt_prio_array {
 
 struct rt_bandwidth {
 	/* nests inside the rq lock: */
-	raw_spinlock_t		rt_runtime_lock;
+	raw_spinlock_t		rt_runtime_lock ____cacheline_aligned_in_smp;
 	ktime_t			rt_period;
 	u64			rt_runtime;
 	struct hrtimer		rt_period_timer;
@@ -343,7 +343,7 @@ static inline int dl_bandwidth_enabled(void)
  *  - total_bw is the currently allocated bandwidth in each root domain;
  */
 struct dl_bw {
-	raw_spinlock_t		lock;
+	raw_spinlock_t		lock ____cacheline_aligned_in_smp;
 	u64			bw;
 	u64			total_bw;
 };
@@ -442,7 +442,7 @@ static inline u64 default_bw_period_us(void)
 
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
-	raw_spinlock_t		lock;
+	raw_spinlock_t		lock ____cacheline_aligned_in_smp;
 	ktime_t			period;
 	u64			quota;
 	u64			runtime;
@@ -803,7 +803,7 @@ struct scx_rq {
 	cpumask_var_t		cpus_to_kick_if_idle;
 	cpumask_var_t		cpus_to_preempt;
 	cpumask_var_t		cpus_to_wait;
-	unsigned long		kick_sync;
+	unsigned long		kick_sync ____cacheline_aligned_in_smp;
 	local_t			reenq_local_deferred;
 	struct balance_callback	deferred_bal_cb;
 	struct irq_work		deferred_irq_work;
@@ -841,7 +841,7 @@ struct rt_rq {
 	u64			rt_time; /* consumed RT time, goes up in update_curr_rt */
 	u64			rt_runtime; /* allotted RT time, "slice" from rt_bandwidth, RT sharing/balancing */
 	/* Nests inside the rq lock: */
-	raw_spinlock_t		rt_runtime_lock;
+	raw_spinlock_t		rt_runtime_lock ____cacheline_aligned_in_smp;
 
 	unsigned int		rt_nr_boosted;
 
@@ -889,7 +889,7 @@ struct dl_rq {
 	 * task wakes up (becomes TASK_RUNNING) and decreased when a
 	 * task blocks
 	 */
-	u64			running_bw;
+	u64			running_bw ____cacheline_aligned;
 
 	/*
 	 * Utilization of the tasks "assigned" to this runqueue (including
@@ -1022,7 +1022,7 @@ struct root_domain {
 	 * For IPI pull requests, loop across the rto_mask.
 	 */
 	struct irq_work		rto_push_work;
-	raw_spinlock_t		rto_lock;
+	raw_spinlock_t		rto_lock ____cacheline_aligned_in_smp;
 	/* These are only updated and read within rto_lock */
 	int			rto_loop;
 	int			rto_cpu;
