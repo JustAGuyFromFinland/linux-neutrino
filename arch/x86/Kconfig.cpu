@@ -2,7 +2,7 @@
 # Put here option for CPU selection and depending optimization
 choice
 	prompt "x86-32 Processor family"
-	depends on X86_32
+	depends on X86_32 || X86_64
 	default M686
 	help
 	  This is the processor type of your CPU. This information is
@@ -142,6 +142,7 @@ config MPENTIUM4
 
 config MNEUTRINO
 	bool "Linux-Neutrino (AVX2/SSE4.2 Optimized)"
+	depends on X86_64
 	help
 	  Optimize for modern x86_64 CPUs with AVX2 and SSE4.2 support.
 	  This will pass -march=haswell and -O3 to the compiler.
