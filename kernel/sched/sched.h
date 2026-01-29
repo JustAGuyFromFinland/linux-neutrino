@@ -92,6 +92,76 @@ struct cpuidle_state;
 #include "cpupri.h"
 #include "cpudeadline.h"
 
+/*
+ * ============================================================================
+ * Cache-line Prefetch Injection for Context Switch
+ * ============================================================================
+ *
+ * Prefetch task's kernel stack into L1 cache while scheduler is still
+ * making decisions. By the time we commit to the context switch, the
+ * stack data is already hot in cache.
+ *
+ * We prefetch multiple cache lines from the stack pointer since context
+ * switch will access the saved registers (inactive_task_frame) and
+ * potentially the pt_regs above it.
+ */
+#define PREFETCH_STACK_LINES	4  /* Prefetch 4 cache lines = 256 bytes on x86 */
+
+/*
+ * Prefetch a task's kernel stack in preparation for context switch.
+ * Called during task selection to hide memory latency.
+ *
+ * @p: task whose stack to prefetch
+ *
+ * Prefetches the stack pointer area where saved registers live.
+ * Uses prefetchw() for exclusive cache line since we'll write to it.
+ */
+static __always_inline void prefetch_task_stack(struct task_struct *p)
+{
+	unsigned long sp;
+	int i;
+
+	if (!p || !p->stack)
+		return;
+
+	/*
+	 * Get the task's saved stack pointer. For x86, this points to
+	 * struct inactive_task_frame on the kernel stack.
+	 */
+	sp = p->thread.sp;
+
+	/* Prefetch multiple cache lines around the stack pointer */
+	for (i = 0; i < PREFETCH_STACK_LINES; i++) {
+		prefetchw((void *)(sp + i * L1_CACHE_BYTES));
+	}
+
+	/*
+	 * Also prefetch the task_struct itself since context_switch
+	 * will access various fields (mm, active_mm, thread, etc.)
+	 */
+	prefetch(&p->thread);
+	prefetch(&p->mm);
+}
+
+/*
+ * Prefetch for a sched_entity (if it's a task, not a group).
+ * Safe to call on group entities - they're silently ignored.
+ *
+ * Note: Uses direct check (!se->my_q) instead of entity_is_task()
+ * because this helper is defined before that macro.
+ */
+static __always_inline void prefetch_task_stack_se(struct sched_entity *se)
+{
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	/* For group scheduling, my_q != NULL means it's a group, not a task */
+	if (!se->my_q)
+		prefetch_task_stack(container_of(se, struct task_struct, se));
+#else
+	/* Without group scheduling, all entities are tasks */
+	prefetch_task_stack(container_of(se, struct task_struct, se));
+#endif
+}
+
 /* task_struct::on_rq states: */
 #define TASK_ON_RQ_QUEUED	1
 #define TASK_ON_RQ_MIGRATING	2
@@ -183,7 +253,7 @@ extern struct list_head asym_cap_list;
  */
 #define RUNTIME_INF		((u64)~0ULL)
 
-static inline int idle_policy(int policy)
+static __always_inline int idle_policy(int policy)
 {
 	return policy == SCHED_IDLE;
 }
@@ -202,12 +272,12 @@ static inline int fair_policy(int policy)
 	return normal_policy(policy) || policy == SCHED_BATCH;
 }
 
-static inline int rt_policy(int policy)
+static __always_inline int rt_policy(int policy)
 {
 	return policy == SCHED_FIFO || policy == SCHED_RR;
 }
 
-static inline int dl_policy(int policy)
+static __always_inline int dl_policy(int policy)
 {
 	return policy == SCHED_DEADLINE;
 }
@@ -218,17 +288,17 @@ static inline bool valid_policy(int policy)
 		rt_policy(policy) || dl_policy(policy);
 }
 
-static inline int task_has_idle_policy(struct task_struct *p)
+static __always_inline int task_has_idle_policy(struct task_struct *p)
 {
 	return idle_policy(p->policy);
 }
 
-static inline int task_has_rt_policy(struct task_struct *p)
+static __always_inline int task_has_rt_policy(struct task_struct *p)
 {
 	return rt_policy(p->policy);
 }
 
-static inline int task_has_dl_policy(struct task_struct *p)
+static __always_inline int task_has_dl_policy(struct task_struct *p)
 {
 	return dl_policy(p->policy);
 }
@@ -1338,14 +1408,14 @@ static inline struct rq *rq_of(struct cfs_rq *cfs_rq)
 }
 #endif /* !CONFIG_FAIR_GROUP_SCHED */
 
-static inline int cpu_of(struct rq *rq)
+static __always_inline int cpu_of(struct rq *rq)
 {
 	return rq->cpu;
 }
 
 #define MDF_PUSH		0x01
 
-static inline bool is_migration_disabled(struct task_struct *p)
+static __always_inline bool is_migration_disabled(struct task_struct *p)
 {
 	return p->migration_disabled;
 }
@@ -2310,7 +2380,7 @@ static inline u64 global_rt_runtime(void)
 /*
  * Is p the current execution context?
  */
-static inline int task_current(struct rq *rq, struct task_struct *p)
+static __always_inline int task_current(struct rq *rq, struct task_struct *p)
 {
 	return rq->curr == p;
 }
@@ -2334,17 +2404,17 @@ static inline bool task_is_blocked(struct task_struct *p)
 	return !!p->blocked_on;
 }
 
-static inline int task_on_cpu(struct rq *rq, struct task_struct *p)
+static __always_inline int task_on_cpu(struct rq *rq, struct task_struct *p)
 {
 	return p->on_cpu;
 }
 
-static inline int task_on_rq_queued(struct task_struct *p)
+static __always_inline int task_on_rq_queued(struct task_struct *p)
 {
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_QUEUED;
 }
 
-static inline int task_on_rq_migrating(struct task_struct *p)
+static __always_inline int task_on_rq_migrating(struct task_struct *p)
 {
 	return READ_ONCE(p->on_rq) == TASK_ON_RQ_MIGRATING;
 }
@@ -3248,6 +3318,7 @@ extern bool sched_debug_verbose;
 extern void print_cfs_stats(struct seq_file *m, int cpu);
 extern void print_rt_stats(struct seq_file *m, int cpu);
 extern void print_dl_stats(struct seq_file *m, int cpu);
+extern void print_wf_queue_stats(struct seq_file *m, int cpu);
 extern void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq);
 extern void print_rt_rq(struct seq_file *m, int cpu, struct rt_rq *rt_rq);
 extern void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq);

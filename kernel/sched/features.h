@@ -123,6 +123,22 @@ SCHED_FEAT(UTIL_EST, true)
 SCHED_FEAT(LATENCY_WARN, false)
 
 /*
+ * Wait-free task wakeup queues. When enabled, remote wakeups are pushed
+ * to a lock-free MPSC queue on the target CPU, avoiding IPI overhead.
+ * The target CPU picks up pending wakeups on its next scheduler tick
+ * or schedule() call without any locking.
+ */
+SCHED_FEAT(WF_WAKEUP, false)
+
+/*
  * Do newidle balancing proportional to its success rate using randomization.
  */
 SCHED_FEAT(NI_RANDOM, true)
+
+/*
+ * Prefetch task stack before context switch. When enabled, the scheduler
+ * prefetches the next task's kernel stack into L1 cache while still
+ * completing the task selection logic. By the time the decision is final,
+ * the stack is already "hot" in cache, reducing context switch latency.
+ */
+SCHED_FEAT(PREFETCH_SWITCH, true)

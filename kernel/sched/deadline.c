@@ -57,18 +57,18 @@ static int __init sched_dl_sysctl_init(void)
 late_initcall(sched_dl_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
-static bool dl_server(struct sched_dl_entity *dl_se)
+static __always_inline bool dl_server(struct sched_dl_entity *dl_se)
 {
 	return dl_se->dl_server;
 }
 
-static inline struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
+static __always_inline struct task_struct *dl_task_of(struct sched_dl_entity *dl_se)
 {
 	BUG_ON(dl_server(dl_se));
 	return container_of(dl_se, struct task_struct, dl);
 }
 
-static inline struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
+static __always_inline struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
 {
 	return container_of(dl_rq, struct rq, dl);
 }
@@ -83,12 +83,12 @@ static inline struct rq *rq_of_dl_se(struct sched_dl_entity *dl_se)
 	return rq;
 }
 
-static inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
+static __always_inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
 {
 	return &rq_of_dl_se(dl_se)->dl;
 }
 
-static inline int on_dl_rq(struct sched_dl_entity *dl_se)
+static __always_inline int on_dl_rq(struct sched_dl_entity *dl_se)
 {
 	return !RB_EMPTY_NODE(&dl_se->rb_node);
 }
@@ -507,6 +507,7 @@ static void task_contending(struct sched_dl_entity *dl_se, int flags)
 		add_rq_bw(dl_se, dl_rq);
 
 	if (dl_se->dl_non_contending) {
+		/* Branchless clearing handled below with cancel */
 		dl_se->dl_non_contending = 0;
 		/*
 		 * If the timer handler is currently running and the
@@ -528,7 +529,7 @@ static void task_contending(struct sched_dl_entity *dl_se, int flags)
 	}
 }
 
-static inline int is_leftmost(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
+static __always_inline int is_leftmost(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 {
 	return rb_first_cached(&dl_rq->root) == &dl_se->rb_node;
 }
@@ -560,7 +561,7 @@ void init_dl_rq(struct dl_rq *dl_rq)
 	init_dl_rq_bw_ratio(dl_rq);
 }
 
-static inline int dl_overloaded(struct rq *rq)
+static __always_inline int dl_overloaded(struct rq *rq)
 {
 	return atomic_read(&rq->rd->dlo_count);
 }
@@ -593,12 +594,12 @@ static inline void dl_clear_overload(struct rq *rq)
 #define __node_2_pdl(node) \
 	rb_entry((node), struct task_struct, pushable_dl_tasks)
 
-static inline bool __pushable_less(struct rb_node *a, const struct rb_node *b)
+static __always_inline bool __pushable_less(struct rb_node *a, const struct rb_node *b)
 {
 	return dl_entity_preempt(&__node_2_pdl(a)->dl, &__node_2_pdl(b)->dl);
 }
 
-static inline int has_pushable_dl_tasks(struct rq *rq)
+static __always_inline int has_pushable_dl_tasks(struct rq *rq)
 {
 	return !RB_EMPTY_ROOT(&rq->dl.pushable_dl_tasks_root.rb_root);
 }
@@ -875,10 +876,9 @@ static void replenish_dl_entity(struct sched_dl_entity *dl_se)
 		replenish_dl_new_period(dl_se, rq);
 	}
 
-	if (dl_se->dl_yielded)
-		dl_se->dl_yielded = 0;
-	if (dl_se->dl_throttled)
-		dl_se->dl_throttled = 0;
+	/* Branchless: clear flags using bitwise AND with inverted condition */
+	dl_se->dl_yielded &= !dl_se->dl_yielded;
+	dl_se->dl_throttled &= !dl_se->dl_throttled;
 
 	/*
 	 * If this is the replenishment of a deferred reservation,
@@ -1071,11 +1071,10 @@ static void update_dl_entity(struct sched_dl_entity *dl_se)
 		/*
 		 * The server can still use its previous deadline, so check if
 		 * it left the dl_defer_running state.
+		 * Branchless: set flags using condition result.
 		 */
-		if (!dl_se->dl_defer_running) {
-			dl_se->dl_defer_armed = 1;
-			dl_se->dl_throttled = 1;
-		}
+		dl_se->dl_defer_armed |= !dl_se->dl_defer_running;
+		dl_se->dl_throttled |= !dl_se->dl_defer_running;
 	}
 }
 
@@ -2094,7 +2093,7 @@ void dec_dl_tasks(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 	dec_dl_deadline(dl_rq, dl_se->deadline);
 }
 
-static inline bool __dl_less(struct rb_node *a, const struct rb_node *b)
+static __always_inline bool __dl_less(struct rb_node *a, const struct rb_node *b)
 {
 	return dl_time_before(__node_2_dle(a)->deadline, __node_2_dle(b)->deadline);
 }
@@ -2624,6 +2623,10 @@ again:
 	} else {
 		p = dl_task_of(dl_se);
 	}
+
+	/* Prefetch task stack while returning */
+	if (p && sched_feat(PREFETCH_SWITCH))
+		prefetch_task_stack(p);
 
 	return p;
 }
@@ -3714,8 +3717,8 @@ int dl_cpuset_cpumask_can_shrink(const struct cpumask *cur,
 	cur_dl_b = dl_bw_of(cpumask_any(cur));
 	cap = __dl_bw_capacity(trial);
 	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
-	if (__dl_overflow(cur_dl_b, cap, 0, 0))
-		ret = 0;
+	/* Branchless: clear ret flag if overflow detected */
+	ret &= !__dl_overflow(cur_dl_b, cap, 0, 0);
 	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
 	rcu_read_unlock_sched();
 

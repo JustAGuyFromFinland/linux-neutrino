@@ -220,9 +220,9 @@ static inline int calc_load_write_idx(void)
 	/*
 	 * If the folding window started, make sure we start writing in the
 	 * next NO_HZ-delta.
+	 * Branchless: increment idx without branch.
 	 */
-	if (!time_before(jiffies, READ_ONCE(calc_load_update)))
-		idx++;
+	idx += !time_before(jiffies, READ_ONCE(calc_load_update));
 
 	return idx & 1;
 }

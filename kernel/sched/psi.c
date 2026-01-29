@@ -839,8 +839,8 @@ static void psi_group_change(struct psi_group *group, int cpu,
 	}
 
 	for (t = 0; set; set &= ~(1 << t), t++)
-		if (set & (1 << t))
-			groupc->tasks[t]++;
+		/* Branchless: increment task count using bit test result */
+		groupc->tasks[t] += !!(set & (1 << t));
 
 	if (!group->enabled) {
 		/*

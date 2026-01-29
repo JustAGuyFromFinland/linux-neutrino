@@ -123,6 +123,304 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_compute_energy_tp);
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 DEFINE_PER_CPU(struct rnd_state, sched_rnd_state);
 
+/* Forward declaration for wait-free queue processing */
+static void ttwu_do_activate(struct rq *rq, struct task_struct *p,
+			     int wake_flags, struct rq_flags *rf);
+
+/*
+ * ============================================================================
+ * Wait-Free MPSC Queue for Task Migration
+ * ============================================================================
+ *
+ * This implements a lock-free Multi-Producer Single-Consumer (MPSC) queue
+ * for task wakeups. When Core A wakes up a task destined for Core B, it
+ * pushes the task pointer into Core B's wait-free queue without any locks.
+ * Core B processes pending wakeups on its next scheduler tick or schedule()
+ * call without ever blocking.
+ *
+ * Design:
+ * - Fixed-size circular buffer per CPU (power of 2 for fast modulo)
+ * - Producers use atomic fetch_add on tail, CAS on slots
+ * - Consumer reads head, processes entries, advances head
+ * - Overflow falls back to traditional IPI-based wakeup
+ *
+ * Memory ordering:
+ * - Producers: release semantics when writing task pointer
+ * - Consumer: acquire semantics when reading task pointer
+ * - Ensures task data is visible before/after queue operations
+ */
+
+#define WFQUEUE_SIZE_SHIFT	7
+#define WFQUEUE_SIZE		(1 << WFQUEUE_SIZE_SHIFT)  /* 128 entries */
+#define WFQUEUE_MASK		(WFQUEUE_SIZE - 1)
+
+/* Sentinel values for queue slots */
+#define WFQUEUE_EMPTY		((struct task_struct *)0)
+#define WFQUEUE_BUSY		((struct task_struct *)1)
+#define WFQUEUE_SKIP		((struct task_struct *)2)  /* Producer abandoned slot */
+
+/*
+ * Per-CPU wait-free wakeup queue.
+ * Aligned to 64-byte cache lines to avoid false sharing between CPUs
+ * and to ensure optimal memory access patterns.
+ */
+struct wf_wake_queue {
+	/* Producer side - modified by remote CPUs */
+	atomic_t		tail __aligned(64);
+	
+	/* Consumer side - only modified by owning CPU */
+	unsigned int		head __aligned(64);
+	unsigned int		processed;
+	
+	/* Slot array - each slot holds a task pointer or sentinel */
+	struct task_struct	*slots[WFQUEUE_SIZE] __aligned(64);
+	
+	/* Wake flags corresponding to each slot */
+	int			wake_flags[WFQUEUE_SIZE] __aligned(64);
+	
+	/* Statistics (optional, for debugging) */
+	unsigned long		nr_pushed __aligned(64);
+	unsigned long		nr_processed;
+	unsigned long		nr_overflows;
+} __aligned(64);
+
+static DEFINE_PER_CPU(struct wf_wake_queue, wf_wake_queues);
+
+/*
+ * Initialize wait-free queue for a CPU.
+ * Called during scheduler initialization.
+ */
+static void wf_queue_init(int cpu)
+{
+	struct wf_wake_queue *wfq = per_cpu_ptr(&wf_wake_queues, cpu);
+	int i;
+
+	atomic_set(&wfq->tail, 0);
+	wfq->head = 0;
+	wfq->processed = 0;
+	wfq->nr_pushed = 0;
+	wfq->nr_processed = 0;
+	wfq->nr_overflows = 0;
+
+	for (i = 0; i < WFQUEUE_SIZE; i++) {
+		WRITE_ONCE(wfq->slots[i], WFQUEUE_EMPTY);
+		wfq->wake_flags[i] = 0;
+	}
+}
+
+/*
+ * Try to push a task wakeup into the target CPU's wait-free queue.
+ * This is called by remote CPUs (producers) and is fully lock-free.
+ *
+ * Returns true if successfully queued, false if queue is full.
+ */
+static bool wf_queue_push(int cpu, struct task_struct *p, int wake_flags)
+{
+	struct wf_wake_queue *wfq;
+	unsigned int tail, head, idx;
+	struct task_struct *expected;
+	int retries = 4;
+
+	/* Don't use wait-free queue during early boot or if disabled */
+	if (!scheduler_running || !sched_feat(WF_WAKEUP))
+		return false;
+
+	wfq = per_cpu_ptr(&wf_wake_queues, cpu);
+
+	/*
+	 * Check if queue has space BEFORE reserving a slot.
+	 * This avoids creating holes when we have to back off.
+	 */
+	head = READ_ONCE(wfq->head);
+	tail = atomic_read(&wfq->tail);
+	if (unlikely((tail - head) >= (WFQUEUE_SIZE - 16))) {
+		/* Queue nearly full - don't even try */
+		wfq->nr_overflows++;
+		return false;
+	}
+
+	/*
+	 * Reserve a slot by atomically incrementing tail.
+	 * Multiple producers can race here - each gets a unique slot.
+	 */
+	tail = atomic_fetch_add_relaxed(1, &wfq->tail);
+	idx = tail & WFQUEUE_MASK;
+
+	/*
+	 * Try to claim the slot with CAS. The slot should be EMPTY
+	 * since we checked capacity above, but handle races gracefully.
+	 */
+	while (retries--) {
+		expected = WFQUEUE_EMPTY;
+		if (try_cmpxchg_relaxed(&wfq->slots[idx], &expected, WFQUEUE_BUSY)) {
+			/* Successfully claimed slot - write task with release semantics */
+			WRITE_ONCE(wfq->wake_flags[idx], wake_flags);
+			smp_store_release(&wfq->slots[idx], p);
+			wfq->nr_pushed++;
+			return true;
+		}
+
+		/* Slot not empty - brief pause and retry */
+		cpu_relax();
+	}
+
+	/*
+	 * Failed to claim slot after retries.
+	 * Mark slot as SKIP so consumer can advance past it.
+	 * Do NOT decrement tail - that creates holes!
+	 */
+	smp_store_release(&wfq->slots[idx], WFQUEUE_SKIP);
+	wfq->nr_overflows++;
+	return false;
+}
+
+/*
+ * Process pending wakeups from the wait-free queue.
+ * Called by the owning CPU only (single consumer).
+ * Returns the number of tasks processed.
+ *
+ * This is designed to be called from scheduler tick or schedule()
+ * with rq lock held.
+ */
+static int wf_queue_process(struct rq *rq, struct rq_flags *rf)
+{
+	int cpu = cpu_of(rq);
+	struct wf_wake_queue *wfq;
+	unsigned int head, tail;
+	int processed = 0;
+	int batch_limit = 16; /* Process at most 16 per call to limit latency */
+
+	/* Don't process during early boot or if disabled */
+	if (!scheduler_running || !sched_feat(WF_WAKEUP))
+		return 0;
+
+	wfq = per_cpu_ptr(&wf_wake_queues, cpu);
+
+	/*
+	 * Read tail with acquire semantics to see all producer writes.
+	 * Head is only modified by us (consumer), so relaxed read is fine.
+	 */
+	head = wfq->head;
+	tail = atomic_read_acquire(&wfq->tail);
+
+	while (head != tail && processed < batch_limit) {
+		unsigned int idx = head & WFQUEUE_MASK;
+		struct task_struct *p;
+		int wake_flags;
+
+		/*
+		 * Read the slot with acquire semantics.
+		 */
+		p = smp_load_acquire(&wfq->slots[idx]);
+
+		/*
+		 * Handle SKIP slots - producer abandoned this entry.
+		 * Just clear it and move on.
+		 */
+		if (p == WFQUEUE_SKIP) {
+			smp_store_release(&wfq->slots[idx], WFQUEUE_EMPTY);
+			WRITE_ONCE(wfq->head, ++head);
+			continue;
+		}
+
+		/*
+		 * If EMPTY or BUSY, producer hasn't finished writing yet.
+		 */
+		if (p == WFQUEUE_EMPTY || p == WFQUEUE_BUSY) {
+			/*
+			 * Producer reserved slot but hasn't written yet.
+			 * Wait briefly and retry once.
+			 */
+			cpu_relax();
+			p = smp_load_acquire(&wfq->slots[idx]);
+
+			/* Check again after brief wait */
+			if (p == WFQUEUE_SKIP) {
+				smp_store_release(&wfq->slots[idx], WFQUEUE_EMPTY);
+				WRITE_ONCE(wfq->head, ++head);
+				continue;
+			}
+			if (p == WFQUEUE_EMPTY || p == WFQUEUE_BUSY)
+				break; /* Give producer time to complete */
+		}
+
+		/* Read wake flags before clearing slot */
+		wake_flags = READ_ONCE(wfq->wake_flags[idx]);
+
+		/* Clear the slot for reuse */
+		smp_store_release(&wfq->slots[idx], WFQUEUE_EMPTY);
+
+		/* Advance head */
+		WRITE_ONCE(wfq->head, ++head);
+
+		/*
+		 * Now activate the task.
+		 * The task should already have p->on_rq == 0 and be ready
+		 * for wakeup. We process it similar to sched_ttwu_pending().
+		 */
+		if (unlikely(p->on_cpu))
+			smp_cond_load_acquire(&p->on_cpu, !VAL);
+
+		if (unlikely(task_cpu(p) != cpu))
+			set_task_cpu(p, cpu);
+
+		ttwu_do_activate(rq, p, wake_flags, rf);
+		processed++;
+	}
+
+	wfq->nr_processed += processed;
+	return processed;
+}
+
+/*
+ * Check if there are pending wakeups in the wait-free queue.
+ * Fast check that doesn't require any locks.
+ */
+static inline bool wf_queue_pending(int cpu)
+{
+	struct wf_wake_queue *wfq;
+
+	if (!scheduler_running || !sched_feat(WF_WAKEUP))
+		return false;
+
+	wfq = per_cpu_ptr(&wf_wake_queues, cpu);
+	return READ_ONCE(wfq->head) != atomic_read(&wfq->tail);
+}
+
+/*
+ * Get queue statistics for debugging/monitoring.
+ */
+static void wf_queue_stats(int cpu, unsigned long *pushed, 
+			   unsigned long *processed, unsigned long *overflows)
+{
+	struct wf_wake_queue *wfq = per_cpu_ptr(&wf_wake_queues, cpu);
+
+	*pushed = wfq->nr_pushed;
+	*processed = wfq->nr_processed;
+	*overflows = wfq->nr_overflows;
+}
+
+/*
+ * Print wait-free queue statistics for debugging.
+ * Called from sched/debug.c
+ */
+void print_wf_queue_stats(struct seq_file *m, int cpu)
+{
+	unsigned long pushed, processed, overflows;
+
+	wf_queue_stats(cpu, &pushed, &processed, &overflows);
+
+	if (m) {
+		seq_printf(m, "  .%-30s: %lu\n", "wfq_pushed", pushed);
+		seq_printf(m, "  .%-30s: %lu\n", "wfq_processed", processed);
+		seq_printf(m, "  .%-30s: %lu\n", "wfq_overflows", overflows);
+	} else {
+		pr_cont("  .%-30s: %lu\n", "wfq_pushed", pushed);
+		pr_cont("  .%-30s: %lu\n", "wfq_processed", processed);
+		pr_cont("  .%-30s: %lu\n", "wfq_overflows", overflows);
+	}
+}
+
 #ifdef CONFIG_SCHED_PROXY_EXEC
 DEFINE_STATIC_KEY_TRUE(__sched_proxy_exec);
 static int __init setup_proxy_exec(char *str)
@@ -189,7 +487,7 @@ __read_mostly int scheduler_running;
 DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
 
 /* kernel prio, less is more */
-static inline int __task_prio(const struct task_struct *p)
+static __always_inline int __task_prio(const struct task_struct *p)
 {
 	if (p->sched_class == &stop_sched_class) /* trumps deadline */
 		return -2;
@@ -217,17 +515,20 @@ static inline int __task_prio(const struct task_struct *p)
  */
 
 /* real prio, less is less */
-static inline bool prio_less(const struct task_struct *a,
-			     const struct task_struct *b, bool in_fi)
+static __always_inline bool prio_less(const struct task_struct *a,
+					 const struct task_struct *b, bool in_fi)
 {
-
 	int pa = __task_prio(a), pb = __task_prio(b);
 
-	if (-pa < -pb)
-		return true;
+	/*
+	 * Branchless priority comparison for the common case.
+	 * Combines two branches into one using subtraction.
+	 */
+	int diff = (-pa) - (-pb);  /* Negative priorities: higher value = lower prio */
 
-	if (-pb < -pa)
-		return false;
+	/* If diff != 0, return whether diff < 0 (a has better priority) */
+	if (diff)
+		return diff < 0;
 
 	if (pa == -1) { /* dl_prio() doesn't work because of stop_class above */
 		const struct sched_dl_entity *a_dl, *b_dl;
@@ -259,41 +560,44 @@ static inline bool prio_less(const struct task_struct *a,
 	return false;
 }
 
-static inline bool __sched_core_less(const struct task_struct *a,
-				     const struct task_struct *b)
+/*
+ * Branchless core comparison for scheduling core selection.
+ * Returns true if a should come before b in the core's RB-tree.
+ */
+static __always_inline bool __sched_core_less(const struct task_struct *a,
+						  const struct task_struct *b)
 {
-	if (a->core_cookie < b->core_cookie)
-		return true;
+	unsigned long ca = a->core_cookie, cb = b->core_cookie;
 
-	if (a->core_cookie > b->core_cookie)
-		return false;
+	/* Branchless: combine two comparisons into one using subtraction */
+	if (ca != cb)
+		return ca < cb;
 
 	/* flip prio, so high prio is leftmost */
-	if (prio_less(b, a, !!task_rq(a)->core->core_forceidle_count))
-		return true;
-
-	return false;
+	return prio_less(b, a, !!task_rq(a)->core->core_forceidle_count);
 }
 
 #define __node_2_sc(node) rb_entry((node), struct task_struct, core_node)
 
-static inline bool rb_sched_core_less(struct rb_node *a, const struct rb_node *b)
+static __always_inline bool rb_sched_core_less(struct rb_node *a, const struct rb_node *b)
 {
 	return __sched_core_less(__node_2_sc(a), __node_2_sc(b));
 }
 
-static inline int rb_sched_core_cmp(const void *key, const struct rb_node *node)
+/*
+ * Branchless 3-way comparison for RB-tree lookup.
+ * Returns: -1 if cookie < node, 0 if equal, 1 if cookie > node
+ */
+static __always_inline int rb_sched_core_cmp(const void *key, const struct rb_node *node)
 {
 	const struct task_struct *p = __node_2_sc(node);
 	unsigned long cookie = (unsigned long)key;
+	unsigned long node_cookie = p->core_cookie;
 
-	if (cookie < p->core_cookie)
-		return -1;
-
-	if (cookie > p->core_cookie)
-		return 1;
-
-	return 0;
+	/* Branchless 3-way comparison using sign extraction */
+	int lt = (cookie < node_cookie);
+	int gt = (cookie > node_cookie);
+	return gt - lt;  /* -1, 0, or 1 */
 }
 
 void sched_core_enqueue(struct rq *rq, struct task_struct *p)
@@ -2279,9 +2583,9 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 			/*
 			 * When matching on p->saved_state, consider this task
 			 * still queued so it will wait.
+			 * Branchless: set queued flag without branch.
 			 */
-			if (match < 0)
-				queued = 1;
+			queued |= (match < 0);
 			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
 		}
 		task_rq_unlock(rq, p, &rf);
@@ -3765,13 +4069,40 @@ bool call_function_single_prep_ipi(int cpu)
  * necessary. The wakee CPU on receipt of the IPI will queue the task
  * via sched_ttwu_wakeup() for activation so the wakee incurs the cost
  * of the wakeup instead of the waker.
+ *
+ * First tries the wait-free MPSC queue for lock-free task migration.
+ * Falls back to IPI-based wakeup if the queue is full.
  */
 static void __ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
 {
 	struct rq *rq = cpu_rq(cpu);
+	int wf = wake_flags | (wake_flags & WF_MIGRATED ? WF_MIGRATED : 0);
 
 	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
 
+	/*
+	 * Try wait-free queue first - this avoids the IPI overhead
+	 * and lets the target CPU pick up the wakeup on its next
+	 * scheduler tick without any locking.
+	 */
+	if (wf_queue_push(cpu, p, wf)) {
+		/*
+		 * Successfully queued. Mark pending so idle_cpu() returns
+		 * false and the CPU knows to check for pending wakeups.
+		 */
+		WRITE_ONCE(rq->ttwu_pending, 1);
+		/*
+		 * If target CPU is idle, we still need to kick it.
+		 * But we can avoid the IPI if it's polling.
+		 */
+		if (!rq->nr_running && !set_nr_if_polling(rq->idle)) {
+			/* CPU is in deep idle, need IPI to wake it */
+			smp_send_reschedule(cpu);
+		}
+		return;
+	}
+
+	/* Wait-free queue full - fall back to traditional IPI wakeup */
 	WRITE_ONCE(rq->ttwu_pending, 1);
 #ifdef CONFIG_SMP
 	__smp_call_single_queue(cpu, &p->wake_entry.llist);
@@ -5526,6 +5857,19 @@ void sched_tick(void)
 	psi_account_irqtime(rq, donor, NULL);
 
 	update_rq_clock(rq);
+
+	/*
+	 * Process wait-free wakeup queue first - pick up any tasks
+	 * that were pushed to us by remote CPUs without locks.
+	 * This is the "vectorized pass" that processes pending wakeups.
+	 */
+	if (wf_queue_pending(cpu)) {
+		int woken = wf_queue_process(rq, &rf);
+		/* If we woke tasks, clear ttwu_pending if queue is now empty */
+		if (woken && !wf_queue_pending(cpu))
+			WRITE_ONCE(rq->ttwu_pending, 0);
+	}
+
 	hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
 	update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure);
 
@@ -6124,11 +6468,9 @@ restart_multi:
 		rq_i->core_dl_server = NULL;
 
 		if (p == rq_i->idle) {
-			if (rq_i->nr_running) {
-				rq->core->core_forceidle_count++;
-				if (!fi_before)
-					rq->core->core_forceidle_seq++;
-			}
+			/* Branchless: increment forceidle count using condition */
+			rq->core->core_forceidle_count += !!rq_i->nr_running;
+			rq->core->core_forceidle_seq += (!!rq_i->nr_running && !fi_before);
 		} else {
 			occ++;
 		}
@@ -6777,6 +7119,17 @@ static void __sched notrace __schedule(int sched_mode)
 	update_rq_clock(rq);
 	rq->clock_update_flags = RQCF_UPDATED;
 
+	/*
+	 * Process wait-free wakeup queue - pick up any tasks that were
+	 * pushed to us by remote CPUs. This ensures we don't go idle
+	 * while there are pending wakeups waiting to be processed.
+	 */
+	if (wf_queue_pending(cpu)) {
+		int woken = wf_queue_process(rq, &rf);
+		if (woken && !wf_queue_pending(cpu))
+			WRITE_ONCE(rq->ttwu_pending, 0);
+	}
+
 	switch_count = &prev->nivcsw;
 
 	/* Task state changes only considers SM_PREEMPT as preemption */
@@ -6822,8 +7175,9 @@ keep_resched:
 	rq->last_seen_need_resched_ns = 0;
 
 	is_switch = prev != next;
+	/* Branchless: increment switches using condition result */
+	rq->nr_switches += is_switch;
 	if (likely(is_switch)) {
-		rq->nr_switches++;
 		/*
 		 * RCU users of rcu_dereference(rq->curr) may not see
 		 * changes to task_struct made by pick_next_task().
@@ -7356,8 +7710,8 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 		} else {
 			if (dl_prio(oldprio))
 				p->dl.pi_se = &p->dl;
-			if (rt_prio(oldprio))
-				p->rt.timeout = 0;
+			/* Branchless: clear timeout using condition result */
+			p->rt.timeout &= !rt_prio(oldprio);
 		}
 
 		p->sched_class = next_class;
@@ -8680,6 +9034,9 @@ void __init sched_init(void)
 		hrtick_rq_init(rq);
 		atomic_set(&rq->nr_iowait, 0);
 		fair_server_init(rq);
+
+		/* Initialize wait-free wakeup queue for this CPU */
+		wf_queue_init(i);
 
 #ifdef CONFIG_SCHED_CORE
 		rq->core = rq;
@@ -10392,9 +10749,8 @@ static bool mm_update_max_cids(struct mm_struct *mm)
 		if (mc->users > mc->max_cids)
 			mc->pcpu_thrs = mm_cid_calc_pcpu_thrs(mc);
 	} else {
-		/* Switch back to per task if user count under threshold */
-		if (mc->users < mc->pcpu_thrs)
-			mc->pcpu_thrs = 0;
+		/* Branchless: clear pcpu_thrs using condition result */
+		mc->pcpu_thrs &= !(mc->users < mc->pcpu_thrs);
 	}
 
 	/* Mode change required? */

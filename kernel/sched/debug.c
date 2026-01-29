@@ -973,6 +973,7 @@ do {									\
 	print_cfs_stats(m, cpu);
 	print_rt_stats(m, cpu);
 	print_dl_stats(m, cpu);
+	print_wf_queue_stats(m, cpu);
 
 	print_rq(m, rq, cpu);
 	SEQ_printf(m, "\n");

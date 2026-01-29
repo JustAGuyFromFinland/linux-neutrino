@@ -115,8 +115,8 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 		idle = do_sched_rt_period_timer(rt_b, overrun);
 		raw_spin_lock(&rt_b->rt_runtime_lock);
 	}
-	if (idle)
-		rt_b->rt_period_active = 0;
+	/* Branchless: clear period_active using condition result */
+	rt_b->rt_period_active &= !idle;
 	raw_spin_unlock(&rt_b->rt_runtime_lock);
 
 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
@@ -168,21 +168,21 @@ static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 
 #define rt_entity_is_task(rt_se) (!(rt_se)->my_q)
 
-static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
+static __always_inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 {
 	WARN_ON_ONCE(!rt_entity_is_task(rt_se));
 
 	return container_of(rt_se, struct task_struct, rt);
 }
 
-static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
+static __always_inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 {
 	/* Cannot fold with non-CONFIG_RT_GROUP_SCHED version, layout */
 	WARN_ON(!rt_group_sched_enabled() && rt_rq->tg != &root_task_group);
 	return rt_rq->rq;
 }
 
-static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
+static __always_inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 {
 	WARN_ON(!rt_group_sched_enabled() && rt_se->rt_rq->tg != &root_task_group);
 	return rt_se->rt_rq;
@@ -336,7 +336,7 @@ static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
 	return rq->online && rq->rt.highest_prio.curr > prev->prio;
 }
 
-static inline int rt_overloaded(struct rq *rq)
+static __always_inline int rt_overloaded(struct rq *rq)
 {
 	return atomic_read(&rq->rd->rto_count);
 }
@@ -370,7 +370,7 @@ static inline void rt_clear_overload(struct rq *rq)
 	cpumask_clear_cpu(rq->cpu, rq->rd->rto_mask);
 }
 
-static inline int has_pushable_tasks(struct rq *rq)
+static __always_inline int has_pushable_tasks(struct rq *rq)
 {
 	return !plist_head_empty(&rq->rt.pushable_tasks);
 }
@@ -396,13 +396,20 @@ static inline void rt_queue_pull_task(struct rq *rq)
 
 static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
 {
+	int old_next_prio = rq->rt.highest_prio.next;
+	int new_prio = p->prio;
+	int prio_mask;
+
 	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
 	plist_node_init(&p->pushable_tasks, p->prio);
 	plist_add(&p->pushable_tasks, &rq->rt.pushable_tasks);
 
-	/* Update the highest prio pushable task */
-	if (p->prio < rq->rt.highest_prio.next)
-		rq->rt.highest_prio.next = p->prio;
+	/*
+	 * Branchless update of highest_prio.next:
+	 * prio_mask is all 1s if new_prio < old_next_prio, all 0s otherwise
+	 */
+	prio_mask = (new_prio - old_next_prio) >> 31;
+	rq->rt.highest_prio.next = (new_prio & prio_mask) | (old_next_prio & ~prio_mask);
 
 	if (!rq->rt.overloaded) {
 		rt_set_overload(rq);
@@ -432,7 +439,7 @@ static void dequeue_pushable_task(struct rq *rq, struct task_struct *p)
 static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
 static void dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count);
 
-static inline int on_rt_rq(struct sched_rt_entity *rt_se)
+static __always_inline int on_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return rt_se->on_rq;
 }
@@ -838,16 +845,16 @@ static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun)
 				if (rt_rq->rt_nr_running && rq->curr == rq->idle)
 					rq_clock_cancel_skipupdate(rq);
 			}
-			if (rt_rq->rt_time || rt_rq->rt_nr_running)
-				idle = 0;
+			/* Branchless: clear idle flag if rt_rq has time or running tasks */
+			idle &= !(rt_rq->rt_time || rt_rq->rt_nr_running);
 			raw_spin_unlock(&rt_rq->rt_runtime_lock);
 		} else if (rt_rq->rt_nr_running) {
 			idle = 0;
-			if (!rt_rq_throttled(rt_rq))
-				enqueue = 1;
+			/* Branchless: set enqueue flag without branch */
+			enqueue |= !rt_rq_throttled(rt_rq);
 		}
-		if (rt_rq->rt_throttled)
-			throttled = 1;
+		/* Branchless: set throttled flag without branch */
+		throttled |= !!rt_rq->rt_throttled;
 
 		if (enqueue)
 			sched_rt_rq_enqueue(rt_rq);
@@ -1080,9 +1087,14 @@ static void
 inc_rt_prio(struct rt_rq *rt_rq, int prio)
 {
 	int prev_prio = rt_rq->highest_prio.curr;
+	int prio_mask;
 
-	if (prio < prev_prio)
-		rt_rq->highest_prio.curr = prio;
+	/*
+	 * Branchless min: update highest_prio.curr only if prio < prev_prio
+	 * prio_mask is all 1s if prio < prev_prio, all 0s otherwise
+	 */
+	prio_mask = (prio - prev_prio) >> 31;
+	rt_rq->highest_prio.curr = (prio & prio_mask) | (prev_prio & ~prio_mask);
 
 	inc_rt_prio_smp(rt_rq, prio, prev_prio);
 }
@@ -1119,8 +1131,8 @@ dec_rt_prio(struct rt_rq *rt_rq, int prio)
 static void
 inc_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
-	if (rt_se_boosted(rt_se))
-		rt_rq->rt_nr_boosted++;
+	/* Branchless: increment boosted count using condition result */
+	rt_rq->rt_nr_boosted += rt_se_boosted(rt_se);
 
 	start_rt_bandwidth(&rt_rq->tg->rt_bandwidth);
 }
@@ -1128,8 +1140,8 @@ inc_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 static void
 dec_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
-	if (rt_se_boosted(rt_se))
-		rt_rq->rt_nr_boosted--;
+	/* Branchless: decrement boosted count using condition result */
+	rt_rq->rt_nr_boosted -= rt_se_boosted(rt_se);
 
 	WARN_ON(!rt_rq->rt_nr_running && rt_rq->rt_nr_boosted);
 }
@@ -1432,8 +1444,8 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
 
-	if (flags & ENQUEUE_WAKEUP)
-		rt_se->timeout = 0;
+	/* Branchless: clear timeout using condition result */
+	rt_se->timeout &= !(flags & ENQUEUE_WAKEUP);
 
 	check_schedstat_required();
 	update_stats_wait_start_rt(rt_rq_of_se(rt_se), rt_se);
@@ -1703,6 +1715,10 @@ static struct task_struct *pick_task_rt(struct rq *rq, struct rq_flags *rf)
 		return NULL;
 
 	p = _pick_next_task_rt(rq);
+
+	/* Prefetch task stack while returning */
+	if (p && sched_feat(PREFETCH_SWITCH))
+		prefetch_task_stack(p);
 
 	return p;
 }
@@ -2482,10 +2498,9 @@ static void watchdog(struct rq *rq, struct task_struct *p)
 	if (soft != RLIM_INFINITY) {
 		unsigned long next;
 
-		if (p->rt.watchdog_stamp != jiffies) {
-			p->rt.timeout++;
-			p->rt.watchdog_stamp = jiffies;
-		}
+		/* Branchless: increment timeout using condition result */
+		p->rt.timeout += (p->rt.watchdog_stamp != jiffies);
+		p->rt.watchdog_stamp = jiffies;
 
 		next = DIV_ROUND_UP(min(soft, hard), USEC_PER_SEC/HZ);
 		if (p->rt.timeout > next) {

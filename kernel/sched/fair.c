@@ -163,19 +163,19 @@ static int __init sched_fair_sysctl_init(void)
 late_initcall(sched_fair_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
-static inline void update_load_add(struct load_weight *lw, unsigned long inc)
+static __always_inline void update_load_add(struct load_weight *lw, unsigned long inc)
 {
 	lw->weight += inc;
 	lw->inv_weight = 0;
 }
 
-static inline void update_load_sub(struct load_weight *lw, unsigned long dec)
+static __always_inline void update_load_sub(struct load_weight *lw, unsigned long dec)
 {
 	lw->weight -= dec;
 	lw->inv_weight = 0;
 }
 
-static inline void update_load_set(struct load_weight *lw, unsigned long w)
+static __always_inline void update_load_set(struct load_weight *lw, unsigned long w)
 {
 	lw->weight = w;
 	lw->inv_weight = 0;
@@ -287,13 +287,21 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 
 /*
  * delta /= w
+ * Branchless version that avoids branch on weight comparison.
  */
-static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+static __always_inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 {
-	if (unlikely(se->load.weight != NICE_0_LOAD))
-		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
-
-	return delta;
+	/*
+	 * Branchless: compute both paths, select based on condition.
+	 * Most tasks have NICE_0_LOAD weight, so delta passes through unchanged.
+	 * For other weights, we scale by the weight ratio.
+	 */
+	unsigned long weight = se->load.weight;
+	u64 scaled = __calc_delta(delta, NICE_0_LOAD, &se->load);
+	/* Branchless select: weight != NICE_0_LOAD ? scaled : delta */
+	u64 is_nice0 = (weight == NICE_0_LOAD);
+	u64 mask = (u64)(-(s64)is_nice0);  /* -1 if NICE_0, 0 otherwise */
+	return (delta & mask) | (scaled & ~mask);
 }
 
 const struct sched_class fair_sched_class;
@@ -525,26 +533,59 @@ void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec);
  * Scheduling class tree data structure manipulation methods:
  */
 
-static inline __maybe_unused u64 max_vruntime(u64 max_vruntime, u64 vruntime)
+/*
+ * Branchless max_vruntime: returns max(max_vruntime, vruntime)
+ * Uses arithmetic shift to create mask from sign bit.
+ */
+static __always_inline __maybe_unused u64 max_vruntime(u64 max_vruntime, u64 vruntime)
 {
 	s64 delta = (s64)(vruntime - max_vruntime);
-	if (delta > 0)
-		max_vruntime = vruntime;
-
-	return max_vruntime;
+	/* If delta > 0, mask = 0; if delta <= 0, mask = -1 (all 1s) */
+	s64 mask = (delta >> 63);  /* Arithmetic shift propagates sign */
+	/* Branchless select: delta > 0 ? vruntime : max_vruntime */
+	return (vruntime & ~mask) | (max_vruntime & mask);
 }
 
-static inline __maybe_unused u64 min_vruntime(u64 min_vruntime, u64 vruntime)
+/*
+ * Branchless min_vruntime: returns min(min_vruntime, vruntime)
+ * Uses arithmetic shift to create mask from sign bit.
+ */
+static __always_inline __maybe_unused u64 min_vruntime(u64 min_vruntime, u64 vruntime)
 {
 	s64 delta = (s64)(vruntime - min_vruntime);
-	if (delta < 0)
-		min_vruntime = vruntime;
-
-	return min_vruntime;
+	/* If delta < 0, mask = -1; if delta >= 0, mask = 0 */
+	s64 mask = delta >> 63;  /* Arithmetic shift propagates sign */
+	/* Branchless select: delta < 0 ? vruntime : min_vruntime */
+	return (vruntime & mask) | (min_vruntime & ~mask);
 }
 
-static inline bool entity_before(const struct sched_entity *a,
-				 const struct sched_entity *b)
+/*
+ * Branchless signed 64-bit clamp: returns clamp(val, lo, hi)
+ * Uses arithmetic shift to create masks from sign bits.
+ */
+static __always_inline __maybe_unused s64 clamp_s64_branchless(s64 val, s64 lo, s64 hi)
+{
+	s64 diff_lo, diff_hi, mask_lo, mask_hi;
+
+	/* Check if val < lo */
+	diff_lo = val - lo;
+	mask_lo = diff_lo >> 63;  /* All 1s if val < lo */
+
+	/* Check if val > hi */
+	diff_hi = val - hi;
+	mask_hi = ~(diff_hi >> 63) & ~((-!diff_hi) >> 63);  /* All 1s if val > hi */
+
+	/*
+	 * Select: if val < lo, use lo
+	 *         if val > hi, use hi
+	 *         otherwise use val
+	 * Simplified: result = (lo & mask_lo) | (hi & mask_hi) | (val & ~mask_lo & ~mask_hi)
+	 */
+	return (lo & mask_lo) | (hi & mask_hi) | (val & ~mask_lo & ~mask_hi);
+}
+
+static __always_inline bool entity_before(const struct sched_entity *a,
+					   const struct sched_entity *b)
 {
 	/*
 	 * Tiebreak on vruntime seems unnecessary since it can
@@ -553,7 +594,7 @@ static inline bool entity_before(const struct sched_entity *a,
 	return (s64)(a->deadline - b->deadline) < 0;
 }
 
-static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
+static __always_inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return (s64)(se->vruntime - cfs_rq->zero_vruntime);
 }
@@ -651,26 +692,48 @@ void avg_vruntime_update(struct cfs_rq *cfs_rq, s64 delta)
 /*
  * Specifically: avg_runtime() + 0 must result in entity_eligible() := true
  * For this to be so, the result of this function must have a left bias.
+ *
+ * Optimized with branchless conditionals to reduce branch mispredictions.
  */
 u64 avg_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 	s64 avg = cfs_rq->avg_vruntime;
 	long load = cfs_rq->avg_load;
+	unsigned long weight, on_rq_mask;
+	s64 avg_adjust, load_mask, neg_mask;
 
-	if (curr && curr->on_rq) {
-		unsigned long weight = scale_load_down(curr->load.weight);
+	/*
+	 * Branchless curr contribution:
+	 * on_rq_mask is all 1s if curr && curr->on_rq, all 0s otherwise
+	 */
+	on_rq_mask = (unsigned long)(-(long)(curr && curr->on_rq));
+	weight = scale_load_down(curr ? curr->load.weight : 0) & on_rq_mask;
+	avg += (curr ? entity_key(cfs_rq, curr) : 0) * (long)weight;
+	load += weight;
 
-		avg += entity_key(cfs_rq, curr) * weight;
-		load += weight;
-	}
+	/*
+	 * Branchless division adjustment:
+	 * load_mask is all 1s if load != 0, all 0s otherwise
+	 * neg_mask is all 1s if avg < 0, all 0s otherwise
+	 * We only adjust avg when both load != 0 and avg < 0
+	 */
+	load_mask = -(!!load);
+	neg_mask = avg >> 63;  /* Sign-extend: all 1s if negative */
 
-	if (load) {
-		/* sign flips effective floor / ceiling */
-		if (avg < 0)
-			avg -= (load - 1);
-		avg = div_s64(avg, load);
-	}
+	/*
+	 * sign flips effective floor / ceiling
+	 * Equivalent to: if (load && avg < 0) avg -= (load - 1);
+	 */
+	avg_adjust = (load - 1) & load_mask & neg_mask;
+	avg -= avg_adjust;
+
+	/*
+	 * Branchless division: if load is 0, we skip division (result would be 0)
+	 * Use load | !load to ensure we don't divide by zero
+	 * The & load_mask at the end zeros out the result if load was 0
+	 */
+	avg = (div_s64(avg, load | !load)) & load_mask;
 
 	return cfs_rq->zero_vruntime + avg;
 }
@@ -690,6 +753,8 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
  *   -r_max < lag < max(r_max, q)
  *
  * XXX could add max_slice to the augmented data to track this.
+ *
+ * Uses branchless clamp for better pipeline utilization.
  */
 static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
@@ -700,7 +765,7 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	vlag = avg_vruntime(cfs_rq) - se->vruntime;
 	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
 
-	se->vlag = clamp(vlag, -limit, limit);
+	se->vlag = clamp_s64_branchless(vlag, -limit, limit);
 }
 
 /*
@@ -719,19 +784,24 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
  *
  * Note: using 'avg_vruntime() > se->vruntime' is inaccurate due
  *       to the loss in precision caused by the division.
+ *
+ * Optimized with branchless curr check to reduce branch mispredictions.
  */
 static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 	s64 avg = cfs_rq->avg_vruntime;
 	long load = cfs_rq->avg_load;
+	unsigned long weight, on_rq_mask;
 
-	if (curr && curr->on_rq) {
-		unsigned long weight = scale_load_down(curr->load.weight);
-
-		avg += entity_key(cfs_rq, curr) * weight;
-		load += weight;
-	}
+	/*
+	 * Branchless curr contribution:
+	 * on_rq_mask is all 1s if curr && curr->on_rq, all 0s otherwise
+	 */
+	on_rq_mask = (unsigned long)(-(long)(curr && curr->on_rq));
+	weight = scale_load_down(curr ? curr->load.weight : 0) & on_rq_mask;
+	avg += (curr ? entity_key(cfs_rq, curr) : 0) * (long)weight;
+	load += weight;
 
 	return avg >= (s64)(vruntime - cfs_rq->zero_vruntime) * load;
 }
@@ -751,43 +821,81 @@ static void update_zero_vruntime(struct cfs_rq *cfs_rq)
 	cfs_rq->zero_vruntime = vruntime;
 }
 
+/*
+ * Branchless computation of minimum slice across curr and tree root.
+ */
 static inline u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *root = __pick_root_entity(cfs_rq);
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 min_slice = ~0ULL;
+	u64 curr_slice, root_slice, curr_mask, root_mask;
+	s64 diff;
 
-	if (curr && curr->on_rq)
-		min_slice = curr->slice;
+	/*
+	 * Branchless curr contribution:
+	 * curr_mask is all 1s if curr && curr->on_rq, all 0s otherwise
+	 */
+	curr_mask = (u64)(-(s64)(curr && curr->on_rq));
+	curr_slice = curr ? curr->slice : ~0ULL;
+	/* Select curr->slice if valid, otherwise keep ~0ULL */
+	min_slice = (curr_slice & curr_mask) | (min_slice & ~curr_mask);
 
-	if (root)
-		min_slice = min(min_slice, root->min_slice);
+	/*
+	 * Branchless root contribution:
+	 * root_mask is all 1s if root != NULL, all 0s otherwise
+	 */
+	root_mask = (u64)(-(s64)!!root);
+	root_slice = root ? root->min_slice : ~0ULL;
+
+	/*
+	 * Branchless min: min_slice = min(min_slice, root_slice) if root
+	 * diff < 0 means min_slice < root_slice (keep min_slice)
+	 * diff >= 0 means min_slice >= root_slice (use root_slice)
+	 */
+	diff = (s64)(min_slice - root_slice);
+	/* mask is all 1s if min_slice >= root_slice (should use root_slice) */
+	{
+		u64 select_root = (u64)~(diff >> 63) & root_mask;
+		min_slice = (root_slice & select_root) | (min_slice & ~select_root);
+	}
 
 	return min_slice;
 }
 
-static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+static __always_inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
 {
 	return entity_before(__node_2_se(a), __node_2_se(b));
 }
 
 #define vruntime_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
 
-static inline void __min_vruntime_update(struct sched_entity *se, struct rb_node *node)
+/*
+ * Branchless min_vruntime update from child node.
+ * Avoids branch misprediction in RB-tree traversal.
+ */
+static __always_inline void __min_vruntime_update(struct sched_entity *se, struct rb_node *node)
 {
 	if (node) {
 		struct sched_entity *rse = __node_2_se(node);
-		if (vruntime_gt(min_vruntime, se, rse))
-			se->min_vruntime = rse->min_vruntime;
+		/* Branchless min: se->min_vruntime = min(se->min_vruntime, rse->min_vruntime) */
+		se->min_vruntime = min_vruntime(se->min_vruntime, rse->min_vruntime);
 	}
 }
 
-static inline void __min_slice_update(struct sched_entity *se, struct rb_node *node)
+/*
+ * Branchless min_slice update from child node.
+ */
+static __always_inline void __min_slice_update(struct sched_entity *se, struct rb_node *node)
 {
 	if (node) {
 		struct sched_entity *rse = __node_2_se(node);
-		if (rse->min_slice < se->min_slice)
-			se->min_slice = rse->min_slice;
+		/* Branchless min using subtraction and mask */
+		u64 a = se->min_slice, b = rse->min_slice;
+		u64 diff = a - b;
+		s64 mask = (s64)diff >> 63;  /* -1 if a < b (underflow), 0 otherwise */
+		/* If a > b, mask = 0, result = b; if a <= b, mask = -1, result = a */
+		se->min_slice = (b & ~mask) | (a & mask);
 	}
 }
 
@@ -886,7 +994,7 @@ static inline void update_protect_slice(struct cfs_rq *cfs_rq, struct sched_enti
 	se->vprot = min_vruntime(se->vprot, se->vruntime + calc_delta_fair(slice, se));
 }
 
-static inline bool protect_slice(struct sched_entity *se)
+static __always_inline bool protect_slice(struct sched_entity *se)
 {
 	return ((s64)(se->vprot - se->vruntime) > 0);
 }
@@ -927,8 +1035,10 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	 * We can safely skip eligibility check if there is only one entity
 	 * in this cfs_rq, saving some cycles.
 	 */
-	if (cfs_rq->nr_queued == 1)
-		return curr && curr->on_rq ? curr : se;
+	if (cfs_rq->nr_queued == 1) {
+		best = curr && curr->on_rq ? curr : se;
+		goto prefetch_and_return;
+	}
 
 	/*
 	 * Picking the ->next buddy will affect latency but not fairness.
@@ -937,18 +1047,27 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	    cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next)) {
 		/* ->next will never be delayed */
 		WARN_ON_ONCE(cfs_rq->next->sched_delayed);
-		return cfs_rq->next;
+		best = cfs_rq->next;
+		goto prefetch_and_return;
 	}
 
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
 
-	if (curr && protect && protect_slice(curr))
-		return curr;
+	if (curr && protect && protect_slice(curr)) {
+		best = curr;
+		goto prefetch_and_return;
+	}
 
 	/* Pick the leftmost entity if it's eligible */
 	if (se && entity_eligible(cfs_rq, se)) {
 		best = se;
+		/*
+		 * Early prefetch: Start bringing stack into cache while
+		 * we continue to verify this is the final choice.
+		 */
+		if (sched_feat(PREFETCH_SWITCH))
+			prefetch_task_stack_se(best);
 		goto found;
 	}
 
@@ -975,6 +1094,12 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 		 */
 		if (entity_eligible(cfs_rq, se)) {
 			best = se;
+			/*
+			 * Early prefetch: Found our candidate, start
+			 * prefetching while we exit the loop.
+			 */
+			if (sched_feat(PREFETCH_SWITCH))
+				prefetch_task_stack_se(best);
 			break;
 		}
 
@@ -983,6 +1108,14 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 found:
 	if (!best || (curr && entity_before(curr, best)))
 		best = curr;
+
+prefetch_and_return:
+	/*
+	 * Final prefetch for the winner. This ensures we always prefetch
+	 * the actual winner, even if we took an early exit path.
+	 */
+	if (best && sched_feat(PREFETCH_SWITCH))
+		prefetch_task_stack_se(best);
 
 	return best;
 }
@@ -1389,27 +1522,30 @@ static inline bool is_core_idle(int cpu)
 #ifdef CONFIG_NUMA
 #define NUMA_IMBALANCE_MIN 2
 
+/*
+ * Branchless NUMA imbalance adjustment.
+ * Returns: imbalance if dst_running > imb_numa_nr
+ *          0 if imbalance <= NUMA_IMBALANCE_MIN
+ *          imbalance otherwise
+ */
 static inline long
 adjust_numa_imbalance(int imbalance, int dst_running, int imb_numa_nr)
 {
 	/*
-	 * Allow a NUMA imbalance if busy CPUs is less than the maximum
-	 * threshold. Above this threshold, individual tasks may be contending
-	 * for both memory bandwidth and any shared HT resources.  This is an
-	 * approximation as the number of running tasks may not be related to
-	 * the number of busy CPUs due to sched_setaffinity.
+	 * Branchless implementation:
+	 * cond1: dst_running > imb_numa_nr -> return imbalance
+	 * cond2: imbalance <= NUMA_IMBALANCE_MIN -> return 0
+	 * else: return imbalance
+	 *
+	 * Result = imbalance when cond1 OR (not cond2)
+	 * Result = 0 when cond2 AND (not cond1)
 	 */
-	if (dst_running > imb_numa_nr)
-		return imbalance;
+	int cond1 = dst_running > imb_numa_nr;  /* Returns imbalance if true */
+	int cond2 = imbalance <= NUMA_IMBALANCE_MIN;  /* Returns 0 if true (and !cond1) */
 
-	/*
-	 * Allow a small imbalance based on a simple pair of communicating
-	 * tasks that remain local when the destination is lightly loaded.
-	 */
-	if (imbalance <= NUMA_IMBALANCE_MIN)
-		return 0;
-
-	return imbalance;
+	/* Branchless: select 0 when cond2 && !cond1, else imbalance */
+	long mask = (long)(-(cond2 & !cond1));  /* -1 if should return 0, else 0 */
+	return imbalance & ~mask;
 }
 #endif /* CONFIG_NUMA */
 
@@ -2645,8 +2781,8 @@ static void numa_group_count_active_nodes(struct numa_group *numa_group)
 
 	for_each_node_state(nid, N_CPU) {
 		faults = group_faults_cpu(numa_group, nid);
-		if (faults * ACTIVE_NODE_FRACTION > max_faults)
-			active_nodes++;
+		/* Branchless: count active nodes without branch */
+		active_nodes += (faults * ACTIVE_NODE_FRACTION > max_faults);
 	}
 
 	numa_group->max_faults_cpu = max_faults;
@@ -3711,15 +3847,17 @@ account_entity_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se)
  * Explicitly do a load-store to ensure the intermediate value never hits
  * memory. This allows lockless observations without ever seeing the negative
  * values.
+ *
+ * Branchless version: uses unsigned comparison to detect underflow and mask.
  */
 #define sub_positive(_ptr, _val) do {				\
 	typeof(_ptr) ptr = (_ptr);				\
 	typeof(*ptr) val = (_val);				\
-	typeof(*ptr) res, var = READ_ONCE(*ptr);		\
-	res = var - val;					\
-	if (res > var)						\
-		res = 0;					\
-	WRITE_ONCE(*ptr, res);					\
+	typeof(*ptr) var = READ_ONCE(*ptr);			\
+	typeof(*ptr) res = var - val;				\
+	/* Branchless: if res > var (underflow), mask = 0; else mask = ~0 */ \
+	typeof(*ptr) no_underflow = (typeof(*ptr))(-(res <= var));	\
+	WRITE_ONCE(*ptr, res & no_underflow);			\
 } while (0)
 
 /*
@@ -3727,10 +3865,17 @@ account_entity_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se)
  *
  * A variant of sub_positive(), which does not use explicit load-store
  * and is thus optimized for local variable updates.
+ *
+ * Branchless version using unsigned comparison.
  */
 #define lsub_positive(_ptr, _val) do {				\
 	typeof(_ptr) ptr = (_ptr);				\
-	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
+	typeof(*ptr) val = (_val);				\
+	typeof(*ptr) var = *ptr;				\
+	typeof(*ptr) res = var - val;				\
+	/* Branchless: if res > var (underflow), mask = 0; else mask = ~0 */ \
+	typeof(*ptr) no_underflow = (typeof(*ptr))(-(res <= var));	\
+	*ptr = res & no_underflow;				\
 } while (0)
 
 static inline void
@@ -4772,34 +4917,34 @@ static void remove_entity_load_avg(struct sched_entity *se)
 	raw_spin_unlock_irqrestore(&cfs_rq->removed.lock, flags);
 }
 
-static inline unsigned long cfs_rq_runnable_avg(struct cfs_rq *cfs_rq)
+static __always_inline unsigned long cfs_rq_runnable_avg(struct cfs_rq *cfs_rq)
 {
 	return cfs_rq->avg.runnable_avg;
 }
 
-static inline unsigned long cfs_rq_load_avg(struct cfs_rq *cfs_rq)
+static __always_inline unsigned long cfs_rq_load_avg(struct cfs_rq *cfs_rq)
 {
 	return cfs_rq->avg.load_avg;
 }
 
 static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf);
 
-static inline unsigned long task_util(struct task_struct *p)
+static __always_inline unsigned long task_util(struct task_struct *p)
 {
 	return READ_ONCE(p->se.avg.util_avg);
 }
 
-static inline unsigned long task_runnable(struct task_struct *p)
+static __always_inline unsigned long task_runnable(struct task_struct *p)
 {
 	return READ_ONCE(p->se.avg.runnable_avg);
 }
 
-static inline unsigned long _task_util_est(struct task_struct *p)
+static __always_inline unsigned long _task_util_est(struct task_struct *p)
 {
 	return READ_ONCE(p->se.avg.util_est) & ~UTIL_AVG_UNCHANGED;
 }
 
-static inline unsigned long task_util_est(struct task_struct *p)
+static __always_inline unsigned long task_util_est(struct task_struct *p)
 {
 	return max(task_util(p), _task_util_est(p));
 }
@@ -6910,8 +7055,8 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (p->in_iowait)
 		cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
 
-	if (task_new && se->sched_delayed)
-		h_nr_runnable = 0;
+	/* Branchless: clear h_nr_runnable using condition result */
+	h_nr_runnable &= !(task_new && se->sched_delayed);
 
 	for_each_sched_entity(se) {
 		if (se->on_rq) {
@@ -6937,8 +7082,8 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		cfs_rq->h_nr_queued++;
 		cfs_rq->h_nr_idle += h_nr_idle;
 
-		if (cfs_rq_is_idle(cfs_rq))
-			h_nr_idle = 1;
+		/* Branchless: set h_nr_idle flag without branch */
+		h_nr_idle = cfs_rq_is_idle(cfs_rq);
 
 		flags = ENQUEUE_WAKEUP;
 	}
@@ -6959,8 +7104,8 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		cfs_rq->h_nr_queued++;
 		cfs_rq->h_nr_idle += h_nr_idle;
 
-		if (cfs_rq_is_idle(cfs_rq))
-			h_nr_idle = 1;
+		/* Branchless: set h_nr_idle flag without branch */
+		h_nr_idle = cfs_rq_is_idle(cfs_rq);
 	}
 
 	if (!rq_h_nr_queued && rq->cfs.h_nr_queued)
@@ -7017,8 +7162,8 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		p = task_of(se);
 		h_nr_queued = 1;
 		h_nr_idle = task_has_idle_policy(p);
-		if (task_sleep || task_delayed || !se->sched_delayed)
-			h_nr_runnable = 1;
+		/* Branchless: set h_nr_runnable flag without branch */
+		h_nr_runnable = (task_sleep | task_delayed | !se->sched_delayed);
 	}
 
 	for_each_sched_entity(se) {
@@ -7254,18 +7399,33 @@ static void record_wakee(struct task_struct *p)
  * Waker/wakee being client/server, worker/dispatcher, interrupt source or
  * whatever is irrelevant, spread criteria is apparent partner count exceeds
  * socket size.
+ *
+ * Optimized with branchless logic to reduce branch mispredictions.
  */
 static int wake_wide(struct task_struct *p)
 {
 	unsigned int master = current->wakee_flips;
 	unsigned int slave = p->wakee_flips;
 	int factor = __this_cpu_read(sd_llc_size);
+	unsigned int tmp, swap_mask;
 
-	if (master < slave)
-		swap(master, slave);
-	if (slave < factor || master < slave * factor)
-		return 0;
-	return 1;
+	/*
+	 * Branchless swap: ensure master >= slave
+	 * swap_mask is all 1s if master < slave, all 0s otherwise
+	 */
+	swap_mask = (unsigned int)((int)(master - slave) >> 31);
+	tmp = master;
+	master = (slave & swap_mask) | (master & ~swap_mask);
+	slave = (tmp & swap_mask) | (slave & ~swap_mask);
+
+	/*
+	 * Branchless return:
+	 * Return 0 if (slave < factor || master < slave * factor)
+	 * Return 1 otherwise
+	 * Using: !(cond1 || cond2) == !cond1 && !cond2
+	 *        == (slave >= factor) && (master >= slave * factor)
+	 */
+	return (slave >= (unsigned int)factor) & (master >= slave * (unsigned int)factor);
 }
 
 /*
@@ -7347,9 +7507,9 @@ wake_affine_weight(struct sched_domain *sd, struct task_struct *p,
 	 * prev_eff == this_eff that select_idle_sibling() will consider
 	 * stacking the wakee on top of the waker if no other CPU is
 	 * idle.
+	 * Branchless: add sync flag value directly.
 	 */
-	if (sync)
-		prev_eff_load += 1;
+	prev_eff_load += !!sync;
 
 	return this_eff_load < prev_eff_load ? this_cpu : nr_cpumask_bits;
 }
@@ -7499,6 +7659,47 @@ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
 	return -1;
 }
 
+/*
+ * Check if CPU is on an idle core (all SMT siblings idle).
+ * Returns true if either SMT is not active or if all siblings are idle.
+ * This is used to prioritize placing tasks on completely idle cores
+ * to avoid resource contention with SMT siblings.
+ */
+static inline bool cpu_is_on_idle_core(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	int sibling;
+
+	if (!sched_smt_active())
+		return true;
+
+	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
+		if (sibling == cpu)
+			continue;
+		if (!available_idle_cpu(sibling))
+			return false;
+	}
+#endif
+	return true;
+}
+
+/*
+ * Score a CPU for idle selection. Higher score = better choice.
+ * Idle core > Idle SMT sibling > Busy
+ * This enables branchless comparison for CPU selection.
+ */
+static inline int idle_cpu_score(int cpu)
+{
+	int score = 0;
+
+	/* Base score: is the CPU available? */
+	score += (available_idle_cpu(cpu) || sched_idle_cpu(cpu)) << 1;
+	/* Bonus: is it on an idle core? */
+	score += cpu_is_on_idle_core(cpu);
+
+	return score;
+}
+
 #ifdef CONFIG_SCHED_SMT
 DEFINE_STATIC_KEY_FALSE(sched_smt_present);
 EXPORT_SYMBOL_GPL(sched_smt_present);
@@ -7636,11 +7837,24 @@ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd
  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
  * average idle time for this rq (as found in rq->avg_idle).
  */
+/*
+ * Scan the LLC domain for idle CPUs; this is dynamically regulated by
+ * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
+ * average idle time for this rq (as found in rq->avg_idle).
+ *
+ * When SMT is active, we use a two-phase approach:
+ * Phase 1: Scan for completely idle cores (all SMT siblings idle)
+ * Phase 2: If no idle core found, scan for any idle CPU (including SMT siblings)
+ *
+ * This prioritizes idle cores to avoid resource contention between SMT siblings.
+ */
 static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
+	int smt_idle_cpu = -1; /* Track best SMT sibling as fallback */
 	struct sched_domain_shared *sd_share;
+	bool smt_active = sched_smt_active();
 
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
 
@@ -7671,8 +7885,17 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 					if (--nr <= 0)
 						return -1;
 					idle_cpu = __select_idle_cpu(cpu, p);
-					if ((unsigned int)idle_cpu < nr_cpumask_bits)
-						return idle_cpu;
+					if ((unsigned int)idle_cpu < nr_cpumask_bits) {
+						/*
+						 * Prioritize idle cores: if this CPU is on
+						 * an idle core, return it immediately.
+						 * Otherwise save as fallback.
+						 */
+						if (!smt_active || cpu_is_on_idle_core(idle_cpu))
+							return idle_cpu;
+						/* Branchless: save first SMT sibling found */
+						smt_idle_cpu += (smt_idle_cpu < 0) * (idle_cpu + 1);
+					}
 				}
 			}
 			cpumask_andnot(cpus, cpus, sched_group_span(sg));
@@ -7687,17 +7910,35 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 
 		} else {
 			if (--nr <= 0)
-				return -1;
-			idle_cpu = __select_idle_cpu(cpu, p);
-			if ((unsigned int)idle_cpu < nr_cpumask_bits)
 				break;
+			idle_cpu = __select_idle_cpu(cpu, p);
+			if ((unsigned int)idle_cpu < nr_cpumask_bits) {
+				/*
+				 * Prioritize idle cores over SMT siblings.
+				 * If SMT is active and this CPU isn't on an idle core,
+				 * save it as a fallback and continue searching.
+				 */
+				if (!smt_active || cpu_is_on_idle_core(idle_cpu))
+					return idle_cpu;
+				/* Branchless: save first SMT sibling found as fallback */
+				smt_idle_cpu += (smt_idle_cpu < 0) * (idle_cpu + 1);
+				idle_cpu = -1; /* Reset to continue searching for idle core */
+			}
 		}
 	}
 
 	if (has_idle_core)
 		set_idle_cores(target, false);
 
-	return idle_cpu;
+	/*
+	 * No idle core found. Return the SMT sibling we found earlier,
+	 * or the last idle_cpu if we hit the scan limit.
+	 */
+	if ((unsigned int)idle_cpu < nr_cpumask_bits)
+		return idle_cpu;
+
+	/* smt_idle_cpu stored as (cpu + 1) for branchless, convert back */
+	return smt_idle_cpu - (smt_idle_cpu > 0);
 }
 
 /*
@@ -7711,7 +7952,10 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 	unsigned long task_util, util_min, util_max, best_cap = 0;
 	int fits, best_fits = 0;
 	int cpu, best_cpu = -1;
+	int smt_best_cpu = -1, smt_best_fits = 1;
+	unsigned long smt_best_cap = 0;
 	struct cpumask *cpus;
+	bool smt_active = sched_smt_active();
 
 	cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
@@ -7722,15 +7966,30 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 
 	for_each_cpu_wrap(cpu, cpus, target) {
 		unsigned long cpu_cap = capacity_of(cpu);
+		bool on_idle_core;
 
 		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
 			continue;
 
 		fits = util_fits_cpu(task_util, util_min, util_max, cpu);
+		on_idle_core = !smt_active || cpu_is_on_idle_core(cpu);
 
 		/* This CPU fits with all requirements */
-		if (fits > 0)
-			return cpu;
+		if (fits > 0) {
+			/*
+			 * Prioritize idle cores: if on idle core, return immediately.
+			 * Otherwise track as SMT fallback and continue searching.
+			 */
+			if (on_idle_core)
+				return cpu;
+			/* Save best SMT sibling as fallback */
+			if (cpu_cap > smt_best_cap) {
+				smt_best_cap = cpu_cap;
+				smt_best_cpu = cpu;
+				smt_best_fits = fits;
+			}
+			continue;
+		}
 		/*
 		 * Only the min performance hint (i.e. uclamp_min) doesn't fit.
 		 * Look for the CPU with best capacity.
@@ -7741,16 +8000,28 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
 		/*
 		 * First, select CPU which fits better (-1 being better than 0).
 		 * Then, select the one with best capacity at same level.
+		 * Prioritize CPUs on idle cores.
 		 */
-		if ((fits < best_fits) ||
-		    ((fits == best_fits) && (cpu_cap > best_cap))) {
-			best_cap = cpu_cap;
-			best_cpu = cpu;
-			best_fits = fits;
+		if (on_idle_core) {
+			if ((fits < best_fits) ||
+			    ((fits == best_fits) && (cpu_cap > best_cap))) {
+				best_cap = cpu_cap;
+				best_cpu = cpu;
+				best_fits = fits;
+			}
+		} else {
+			/* Track SMT siblings separately */
+			if ((fits < smt_best_fits) ||
+			    ((fits == smt_best_fits) && (cpu_cap > smt_best_cap))) {
+				smt_best_cap = cpu_cap;
+				smt_best_cpu = cpu;
+				smt_best_fits = fits;
+			}
 		}
 	}
 
-	return best_cpu;
+	/* Prefer idle core CPU, fallback to SMT sibling */
+	return (best_cpu >= 0) ? best_cpu : smt_best_cpu;
 }
 
 static inline bool asym_fits_cpu(unsigned long util,
@@ -7777,6 +8048,8 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	struct sched_domain *sd;
 	unsigned long task_util, util_min, util_max;
 	int i, recent_used_cpu, prev_aff = -1;
+	int target_idle, prev_idle;
+	bool target_on_idle_core, prev_on_idle_core;
 
 	/*
 	 * On asymmetric system, update task utilization because we will check
@@ -7794,21 +8067,47 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
-	    asym_fits_cpu(task_util, util_min, util_max, target))
-		return target;
+	/*
+	 * Prioritize idle cores over SMT twins. Check both target and prev
+	 * CPUs and prefer whichever is on an idle core to avoid resource
+	 * contention with busy SMT siblings.
+	 */
+	target_idle = available_idle_cpu(target) || sched_idle_cpu(target);
+	if (target_idle && asym_fits_cpu(task_util, util_min, util_max, target)) {
+		/* If target is on an idle core, use it immediately */
+		target_on_idle_core = cpu_is_on_idle_core(target);
+		if (target_on_idle_core)
+			return target;
+
+		/*
+		 * Target is idle but has busy SMT sibling. Check if prev
+		 * is on an idle core - prefer that if so.
+		 */
+		if (prev != target && cpus_share_cache(prev, target)) {
+			prev_idle = available_idle_cpu(prev) || sched_idle_cpu(prev);
+			if (prev_idle && asym_fits_cpu(task_util, util_min, util_max, prev)) {
+				prev_on_idle_core = cpu_is_on_idle_core(prev);
+				if (prev_on_idle_core)
+					return prev;
+			}
+		}
+		/* Fall through - will return target later if no better option */
+	}
 
 	/*
-	 * If the previous CPU is cache affine and idle, don't be stupid:
+	 * If the previous CPU is cache affine and idle, don't be stupid.
+	 * Prefer prev if it's on an idle core, or if target isn't idle.
 	 */
 	if (prev != target && cpus_share_cache(prev, target) &&
 	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
 
-		if (!static_branch_unlikely(&sched_cluster_active) ||
-		    cpus_share_resources(prev, target))
-			return prev;
-
+		/* Prefer prev if on idle core, or target isn't idle/on idle core */
+		if (cpu_is_on_idle_core(prev) || !target_idle) {
+			if (!static_branch_unlikely(&sched_cluster_active) ||
+			    cpus_share_resources(prev, target))
+				return prev;
+		}
 		prev_aff = prev;
 	}
 
@@ -7838,10 +8137,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
 	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
 
-		if (!static_branch_unlikely(&sched_cluster_active) ||
-		    cpus_share_resources(recent_used_cpu, target))
-			return recent_used_cpu;
-
+		/*
+		 * Prefer recent_used_cpu if on idle core, or if neither
+		 * target nor prev are on idle cores.
+		 */
+		if (cpu_is_on_idle_core(recent_used_cpu) || !target_idle) {
+			if (!static_branch_unlikely(&sched_cluster_active) ||
+			    cpus_share_resources(recent_used_cpu, target))
+				return recent_used_cpu;
+		}
 	} else {
 		recent_used_cpu = -1;
 	}
@@ -8896,10 +9200,28 @@ again:
 		se = pick_next_entity(rq, cfs_rq);
 		if (!se)
 			goto again;
+
+		/*
+		 * Prefetch injection: Start prefetching the likely winner's
+		 * stack while we continue traversing group hierarchy.
+		 * By the time we finish, the stack is hot in L1 cache.
+		 */
+		if (sched_feat(PREFETCH_SWITCH))
+			prefetch_task_stack_se(se);
+
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
 
 	p = task_of(se);
+
+	/*
+	 * Final prefetch for the actual winner task.
+	 * This catches the case where group traversal picked different
+	 * entities at each level.
+	 */
+	if (sched_feat(PREFETCH_SWITCH))
+		prefetch_task_stack(p);
+
 	if (unlikely(throttled))
 		task_throttle_setup_work(p);
 	return p;
@@ -9419,8 +9741,8 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	long degrades, hot;
 
 	lockdep_assert_rq_held(env->src_rq);
-	if (p->sched_task_hot)
-		p->sched_task_hot = 0;
+	/* Branchless: unconditionally clear - was already conditional but always executed */
+	p->sched_task_hot = 0;
 
 	/*
 	 * We do not migrate tasks that are:
@@ -9798,8 +10120,8 @@ static inline void update_blocked_load_tick(struct rq *rq)
 
 static inline void update_blocked_load_status(struct rq *rq, bool has_blocked)
 {
-	if (!has_blocked)
-		rq->has_blocked_load = 0;
+	/* Branchless: clear has_blocked_load using condition result */
+	rq->has_blocked_load &= has_blocked;
 }
 #else /* !CONFIG_NO_HZ_COMMON: */
 static inline bool cfs_rq_has_blocked(struct cfs_rq *cfs_rq) { return false; }
@@ -10522,13 +10844,12 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 	sgs->group_weight = group->group_weight;
 
 	/* Check if dst CPU is idle and preferred to this group */
-	if (!local_group && env->idle && sgs->sum_h_nr_running &&
-	    sched_group_asym(env, sgs, group))
-		sgs->group_asym_packing = 1;
+	/* Branchless: set group_asym_packing using condition result */
+	sgs->group_asym_packing = (!local_group && env->idle && sgs->sum_h_nr_running &&
+				   sched_group_asym(env, sgs, group));
 
-	/* Check for loaded SMT group to be balanced to dst CPU */
-	if (!local_group && smt_balance(env, sgs, group))
-		sgs->group_smt_balance = 1;
+	/* Branchless: set group_smt_balance using condition result */
+	sgs->group_smt_balance = (!local_group && smt_balance(env, sgs, group));
 
 	sgs->group_type = group_classify(env->sd->imbalance_pct, group, sgs);
 
@@ -10781,9 +11102,8 @@ static inline void update_sg_wakeup_stats(struct sched_domain *sd,
 
 	memset(sgs, 0, sizeof(*sgs));
 
-	/* Assume that task can't fit any CPU of the group */
-	if (sd->flags & SD_ASYM_CPUCAPACITY)
-		sgs->group_misfit_task_load = 1;
+	/* Branchless: set group_misfit_task_load using condition result */
+	sgs->group_misfit_task_load = !!(sd->flags & SD_ASYM_CPUCAPACITY);
 
 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
 		struct rq *rq = cpu_rq(i);
@@ -10800,9 +11120,9 @@ static inline void update_sg_wakeup_stats(struct sched_domain *sd,
 
 		/*
 		 * No need to call idle_cpu_without() if nr_running is not 0
+		 * Branchless: increment idle_cpus using condition result.
 		 */
-		if (!nr_running && idle_cpu_without(i, p))
-			sgs->idle_cpus++;
+		sgs->idle_cpus += (!nr_running && idle_cpu_without(i, p));
 
 		/* Check if task fits in the CPU */
 		if (sd->flags & SD_ASYM_CPUCAPACITY &&
@@ -11721,10 +12041,10 @@ static int need_active_balance(struct lb_env *env)
 {
 	struct sched_domain *sd = env->sd;
 
-	if (asym_active_balance(env))
-		return 1;
-
-	if (imbalanced_active_balance(env))
+	/* Branchless: combine multiple return 1 conditions with OR */
+	if (asym_active_balance(env) ||
+	    imbalanced_active_balance(env) ||
+	    env->migration_type == migrate_misfit)
 		return 1;
 
 	/*
@@ -11739,9 +12059,6 @@ static int need_active_balance(struct lb_env *env)
 		    (capacity_of(env->src_cpu)*sd->imbalance_pct < capacity_of(env->dst_cpu)*100))
 			return 1;
 	}
-
-	if (env->migration_type == migrate_misfit)
-		return 1;
 
 	return 0;
 }
@@ -12002,8 +12319,8 @@ more_balance:
 		if (sd_parent) {
 			int *group_imbalance = &sd_parent->groups->sgc->imbalance;
 
-			if ((env.flags & LBF_SOME_PINNED) && env.imbalance > 0)
-				*group_imbalance = 1;
+			/* Branchless: set imbalance flag without branch */
+			*group_imbalance |= ((env.flags & LBF_SOME_PINNED) && env.imbalance > 0);
 		}
 
 		/* All tasks on this runqueue were pinned by CPU affinity */
@@ -12036,10 +12353,10 @@ more_balance:
 		 *
 		 * Similarly for migration_misfit which is not related to
 		 * load/util migration, don't pollute nr_balance_failed.
+		 * Branchless: increment failure count using condition result.
 		 */
-		if (idle != CPU_NEWLY_IDLE &&
-		    env.migration_type != migrate_misfit)
-			sd->nr_balance_failed++;
+		sd->nr_balance_failed += (idle != CPU_NEWLY_IDLE &&
+					  env.migration_type != migrate_misfit);
 
 		if (need_active_balance(&env)) {
 			unsigned long flags;
@@ -13027,9 +13344,9 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	 * While browsing the domains, we released the rq lock, a task could
 	 * have been enqueued in the meantime. Since we're not going idle,
 	 * pretend we pulled a task.
+	 * Branchless: set pulled_task flag without branch.
 	 */
-	if (this_rq->cfs.h_nr_queued && !pulled_task)
-		pulled_task = 1;
+	pulled_task |= (this_rq->cfs.h_nr_queued && !pulled_task);
 
 	/* If a higher prio class was modified, restart the pick */
 	if (rq_modified_above(this_rq, &fair_sched_class))

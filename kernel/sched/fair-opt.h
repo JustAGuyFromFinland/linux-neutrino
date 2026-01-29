@@ -104,19 +104,22 @@ static __always_inline unsigned int branchless_inc_if(unsigned int count,
  * SoA (Structure of Arrays) for batch processing CPU statistics
  * in load balancing. Instead of accessing rq structures one by one,
  * we batch-gather statistics for better cache utilization.
+ *
+ * All arrays are 64-byte aligned for optimal cache line usage and
+ * SIMD operations on Haswell and newer architectures.
  */
 #define LB_BATCH_SIZE 8
 
 struct lb_cpu_stats_soa {
-	unsigned long loads[LB_BATCH_SIZE] ____cacheline_aligned_in_smp;
-	unsigned long utils[LB_BATCH_SIZE];
-	unsigned long runnables[LB_BATCH_SIZE];
-	unsigned int nr_running[LB_BATCH_SIZE];
-	unsigned int h_nr_runnable[LB_BATCH_SIZE];
-	unsigned int idle_flags[LB_BATCH_SIZE]; /* 1 if idle, 0 otherwise */
-	int cpus[LB_BATCH_SIZE];
+	unsigned long loads[LB_BATCH_SIZE] __aligned(64);
+	unsigned long utils[LB_BATCH_SIZE] __aligned(64);
+	unsigned long runnables[LB_BATCH_SIZE] __aligned(64);
+	unsigned int nr_running[LB_BATCH_SIZE] __aligned(64);
+	unsigned int h_nr_runnable[LB_BATCH_SIZE] __aligned(64);
+	unsigned int idle_flags[LB_BATCH_SIZE] __aligned(64); /* 1 if idle, 0 otherwise */
+	int cpus[LB_BATCH_SIZE] __aligned(64);
 	int count;
-} ____cacheline_aligned_in_smp;
+} __aligned(64);
 
 /*
  * Initialize lb_cpu_stats_soa structure.

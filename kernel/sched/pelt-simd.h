@@ -21,22 +21,24 @@
  * multiple entities in parallel using SIMD operations.
  *
  * This allows AVX2 to process 4 x u64 values simultaneously.
+ * All arrays are 64-byte aligned for optimal cache line usage
+ * and to ensure proper alignment for AVX2/AVX-512 operations.
  */
 #define PELT_BATCH_SIZE 4
 
 struct sched_avg_soa {
-	u64 last_update_time[PELT_BATCH_SIZE] ____cacheline_aligned_in_smp;
-	u64 load_sum[PELT_BATCH_SIZE];
-	u64 runnable_sum[PELT_BATCH_SIZE];
-	u32 util_sum[PELT_BATCH_SIZE];
-	u32 period_contrib[PELT_BATCH_SIZE];
-	unsigned long load_avg[PELT_BATCH_SIZE];
-	unsigned long runnable_avg[PELT_BATCH_SIZE];
-	unsigned long util_avg[PELT_BATCH_SIZE];
-	unsigned int util_est[PELT_BATCH_SIZE];
+	u64 last_update_time[PELT_BATCH_SIZE] __aligned(64);
+	u64 load_sum[PELT_BATCH_SIZE] __aligned(64);
+	u64 runnable_sum[PELT_BATCH_SIZE] __aligned(64);
+	u32 util_sum[PELT_BATCH_SIZE] __aligned(64);
+	u32 period_contrib[PELT_BATCH_SIZE] __aligned(64);
+	unsigned long load_avg[PELT_BATCH_SIZE] __aligned(64);
+	unsigned long runnable_avg[PELT_BATCH_SIZE] __aligned(64);
+	unsigned long util_avg[PELT_BATCH_SIZE] __aligned(64);
+	unsigned int util_est[PELT_BATCH_SIZE] __aligned(64);
 	/* Validity mask: 1 = valid entry, 0 = skip */
 	u8 valid_mask;
-} ____cacheline_aligned_in_smp;
+} __aligned(64);
 
 /*
  * Branchless minimum: returns min(a, b) without branches
